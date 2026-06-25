@@ -29,9 +29,8 @@ from rich.text import Text
 # ──────────────────────────────────────────────
 #  CONFIG
 # ──────────────────────────────────────────────
-REFRESH_INTERVAL  = 3    # squeue table (ligero, ~10ms)
+REFRESH_INTERVAL  = 3    # squeue table (lightweight, ~10ms)
 LOG_TAIL_LINES    = 200
-LOG_REFRESH_SECS  = 2    # log viewer auto-refresh
 MY_USER           = os.environ.get("USER", "")
 HISTORY_FILE      = Path.home() / ".slurm_dashboard_history.json"
 EVENT_LOG_FILE    = Path.home() / ".slurm_dashboard_events.log"
@@ -50,10 +49,17 @@ def load_history() -> list[dict]:
         return []
 
 def save_history(history: list[dict]) -> None:
+    """Atomic write: write to a temp file then rename, so the history JSON
+    is never left in a truncated/corrupt state if the process is killed."""
+    tmp = HISTORY_FILE.with_suffix(".tmp")
     try:
-        HISTORY_FILE.write_text(json.dumps(history[-MAX_HISTORY:], indent=2))
+        tmp.write_text(json.dumps(history[-MAX_HISTORY:], indent=2))
+        tmp.replace(HISTORY_FILE)
     except Exception:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def append_event_log(ts: str, msg: str) -> None:
@@ -235,8 +241,73 @@ def parse_squeue() -> list[dict]:
             "gpus":      gpu_val,
             "reason":    parts[10] if parts[10] != "None" else "",
             "nodes":     parts[11],
+            "est_start": "",          # filled in by refresh_data()
         })
     return jobs
+
+
+def get_start_estimates() -> dict[str, str]:
+    """
+    Query `squeue --start` for estimated start times of PENDING jobs.
+    Returns a dict  {jobid: human_readable_start_string}.
+
+    squeue --start uses the format:
+      JOBID PARTITION NAME USER STATE START_TIME ...
+    We request only JOBID and START_TIME via --format.
+    """
+    try:
+        out = run_out([
+            "squeue", "--start", "--noheader",
+            "--format=%i|%S",          # jobid | expected_start
+        ])
+    except Exception:
+        return {}
+
+    estimates: dict[str, str] = {}
+    now = datetime.now()
+    today = now.date()
+
+    for line in out.strip().splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        jobid = parts[0].strip()
+        raw   = parts[1].strip()
+        if not jobid or raw in ("", "N/A", "Unknown", "None"):
+            continue
+
+        # Slurm emits ISO-8601: "2026-06-22T14:30:00" or "N/A"
+        label = _format_start_time(raw, now, today)
+        if label:
+            estimates[jobid] = label
+
+    return estimates
+
+
+def _format_start_time(raw: str, now: datetime, today) -> str:
+    """Convert a Slurm ISO-8601 start-time string to a compact human label."""
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return ""   # unrecognised format
+
+    delta_mins = int((dt - now).total_seconds() / 60)
+
+    if delta_mins < 0:
+        return "now"                          # already overdue / imminent
+    if delta_mins < 60:
+        return f"~{delta_mins}m"              # "~34m"
+    if dt.date() == today:
+        return dt.strftime("today %H:%M")     # "today 18:45"
+    if (dt.date() - today).days == 1:
+        return dt.strftime("tmrw  %H:%M")     # "tmrw  09:00"
+    if (dt.date() - today).days < 7:
+        return dt.strftime("%a   %H:%M")      # "Wed   14:30"
+    return dt.strftime("%b %-d")              # "Jul  3"
 
 def parse_sinfo() -> list[dict]:
     fmt = "%N|%P|%t|%C|%m|%G|%f"
@@ -330,7 +401,7 @@ def tail_file(path: str, n: int = LOG_TAIL_LINES) -> str:
 #  RESOURCE MONITORING
 # ──────────────────────────────────────────────
 def get_job_nodes(jobid: str) -> list[str]:
-    """Devuelve lista de nodes asignados a un job."""
+    """Return list of nodes assigned to a job."""
     out = run_out(["squeue", "-j", jobid, "-h", "--format=%N"])
     nodelist = out.strip()
     if not nodelist or nodelist in ("(None)", "N/A", ""):
@@ -358,7 +429,7 @@ def ssh_cmd(node: str, cmd: str, timeout: int = 8) -> str:
 
 def get_node_gpu_info(node: str) -> list[dict]:
     """
-    Intenta obtener info de GPU via nvidia-smi.
+    Try to get GPU info via nvidia-smi.
     Returns empty list if no GPUs or no access.
     """
     cmd = (
@@ -444,7 +515,7 @@ def get_job_sstat(jobid: str) -> dict:
     return result
 
 def parse_time_to_secs(t: str) -> int:
-    """Convierte time SLURM (DD-HH:MM:SS o HH:MM:SS o MM:SS) a segundos."""
+    """Convert a Slurm time string (DD-HH:MM:SS or HH:MM:SS or MM:SS) to seconds."""
     t = t.strip()
     if t in ("UNLIMITED", "N/A", ""):
         return 0
@@ -464,7 +535,7 @@ def parse_time_to_secs(t: str) -> int:
     return 0
 
 def make_bar(pct: int, width: int = 20, fill: str = "█", empty: str = "░") -> str:
-    """Genera barra de progreso ASCII."""
+    """Generate an ASCII progress bar."""
     pct = max(0, min(100, pct))
     filled = int(width * pct / 100)
     return fill * filled + empty * (width - filled)
@@ -484,7 +555,7 @@ def get_submit_line(jobid: str) -> str:
     2. scontrol show job Command= (available while the job exists in Slurm)
     Returns the .sh script path or the full sbatch line, or "" if not found.
     """
-    # Fuente 1: sacct SubmitLine
+    # Source 1: sacct SubmitLine
     try:
         out = run_out(["sacct", "-j", jobid, "-X", "-n", "-P", "--format=SubmitLine"])
         for line in out.splitlines():
@@ -494,7 +565,7 @@ def get_submit_line(jobid: str) -> str:
     except Exception:
         pass
 
-    # Fuente 2: scontrol show job -> campo Command=
+    # Source 2: scontrol show job -> Command= field
     try:
         out = run_out(["scontrol", "show", "job", jobid])
         m = re.search(r"Command=(\S+)", out)
@@ -509,7 +580,7 @@ def get_submit_line(jobid: str) -> str:
 
 def get_job_script_info(jobid: str) -> dict:
     """
-    Extrae Command, WorkDir y ExtraArgs de scontrol show job
+    Extract Command and WorkDir from scontrol show job
     to allow building an sbatch command manually.
     """
     info = {"command": "", "workdir": "", "extra": ""}
@@ -526,13 +597,15 @@ def get_job_script_info(jobid: str) -> dict:
 def run_sbatch(args: list[str]) -> tuple[bool, str]:
     """Launch sbatch with the given args. Returns (ok, message)."""
     try:
-        proc = subprocess.run(
-            args, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, timeout=30
-        )
+        with open(os.devnull, "r") as devnull:
+            proc = subprocess.run(
+                args, stdin=devnull, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=30,
+                close_fds=True,
+            )
         if proc.returncode == 0:
             return True, proc.stdout.strip() or "Job resubmitted"
-        return False, proc.stderr.strip() or "sbatch error desconocido"
+        return False, proc.stderr.strip() or "sbatch unknown error"
     except Exception as e:
         return False, str(e)
 
@@ -543,7 +616,7 @@ def rerun_history_job(jobid: str) -> tuple[bool, str]:
       2. scontrol Command= -> sbatch <script>
       3. scontrol requeue  -> back to PENDING (only jobs still in Slurm)
     """
-    # Estrategia 1 + 2: get_submit_line ya combina ambas
+    # Strategy 1 + 2: get_submit_line already combines both sources
     submit_line = get_submit_line(jobid)
     if submit_line:
         try:
@@ -556,14 +629,14 @@ def rerun_history_job(jobid: str) -> tuple[bool, str]:
         except Exception as e:
             return False, str(e)
 
-    # Estrategia 3: scontrol requeue
+    # Strategy 3: scontrol requeue
     proc = subprocess.run(
         ["scontrol", "requeue", jobid],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, timeout=20,
     )
     if proc.returncode == 0:
-        return True, f"Job {jobid} requeued → vuelve a PENDING"
+        return True, f"Job {jobid} requeued → back to PENDING"
 
     return False, (
         "Could not resubmit the job. Possible causes:\n"
@@ -603,7 +676,7 @@ def compute_history_stats(history: list[dict]) -> dict:
     by_partition = Counter(e.get("partition", "unknown") for e in history)
 
     # ── GPU-horas aproximadas (solo jobs COMPLETED) ──
-    # Usamos last_seen - first_seen as a proxy for actual execution time
+    # Uses last_seen - first_seen as a proxy for actual execution time
     gpu_hours = 0.0
     cpu_hours = 0.0
     wall_times = []
@@ -816,9 +889,9 @@ def _safe_log_path(raw: str, script: str) -> tuple[str, str]:
 def submit_job(template: dict) -> tuple[bool, str]:
     script = template.get("script", "")
     if not script:
-        return False, "No se especifico un script"
+        return False, "No script specified"
 
-    # Resolver y sanear paths de logs ANTES de llamar sbatch
+    # Resolve and sanitise log paths BEFORE calling sbatch
     out_raw = template.get("output", "")
     err_raw = template.get("error", "")
     out_path, out_dir = _safe_log_path(out_raw, script)
@@ -906,7 +979,7 @@ class SubmitJobModal(ModalScreen):
     DEFAULT_CSS = """
     SubmitJobModal { align: center middle; }
     #submit-dialog {
-        width: 80; background: #161b22; border: solid #30363d;
+        width: 90%; max-width: 88; background: #161b22; border: solid #30363d;
         padding: 1 2; layout: vertical;
     }
     #submit-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
@@ -936,8 +1009,8 @@ class SubmitJobModal(ModalScreen):
             yield Label("🚀  Submit new job (sbatch)", id="submit-title")
             yield from self._field("Script (.sh):",  "script",    "/path/to/job.sh")
             yield from self._field("Job name:",      "job_name",  "my_job")
-            yield from self._field("Partition:",      "partition", "test")
-            yield from self._field("Account:",       "account",   "user")
+            yield from self._field("Partition:",      "partition", "gpu_part")
+            yield from self._field("Account:",       "account",   "my_account")
             yield from self._field("Nodes:",         "nodes",     "1")
             yield from self._field("GPUs per node:", "gpus",      "4")
             yield from self._field("CPUs per task:", "cpus",      "40")
@@ -981,7 +1054,7 @@ class ArrayJobModal(ModalScreen):
     """Shows all tasks of an array job with individual state."""
     DEFAULT_CSS = """
     ArrayJobModal { align: center middle; }
-    #array-dialog { width: 90; height: 30; background: #161b22;
+    #array-dialog { width: 92%; max-width: 96; height: 80%; max-height: 32; background: #161b22;
                     border: solid #30363d; padding: 1 2; layout: vertical; }
     #array-title  { color: #f0883e; text-style: bold; margin-bottom: 1; }
     #array-table  { height: 1fr; }
@@ -1057,7 +1130,7 @@ class DependencyTreeModal(ModalScreen):
     """Shows the dependency tree of a job in ASCII."""
     DEFAULT_CSS = """
     DependencyTreeModal { align: center middle; }
-    #dep-dialog { width: 80; height: 28; background: #161b22;
+    #dep-dialog { width: 90%; max-width: 86; height: 75%; max-height: 30; background: #161b22;
                   border: solid #30363d; padding: 1 2; layout: vertical; }
     #dep-title  { color: #8957e5; text-style: bold; margin-bottom: 1; }
     #dep-log    { height: 1fr; border: solid #21262d; background: #0d1117; }
@@ -1134,7 +1207,7 @@ class ConfirmModal(ModalScreen[bool]):
     DEFAULT_CSS = """
     ConfirmModal { align: center middle; }
     #confirm-box {
-        width: 62; height: 11;
+        width: 85%; max-width: 66; height: auto;
         background: #161b22; border: double #f85149; padding: 1 2;
     }
     #confirm-title { text-style: bold; color: #f85149; margin-bottom: 1; }
@@ -1171,7 +1244,7 @@ class ConfirmModal(ModalScreen[bool]):
 class JobDetailModal(ModalScreen):
     DEFAULT_CSS = """
     JobDetailModal { align: center middle; }
-    #detail-box { width: 90%; height: 80%; background: #0d1117; border: solid #30363d; }
+    #detail-box { width: 96%; height: 85%; background: #0d1117; border: solid #30363d; }
     #detail-title { background: #161b22; color: #58a6ff; text-style: bold; padding: 0 2; height: 1; }
     #detail-text  { height: 1fr; padding: 1 2; }
     #detail-close { background: #21262d; color: #c9d1d9; border: none; margin: 0 2 1 2; width: 100%; }
@@ -1235,7 +1308,7 @@ class EditorPickerModal(ModalScreen):
     DEFAULT_CSS = """
     EditorPickerModal { align: center middle; }
     #picker-box {
-        width: 58; height: auto; background: #161b22;
+        width: 88%; max-width: 62; height: auto; background: #161b22;
         border: double #1f6feb; padding: 1 2;
     }
     #picker-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
@@ -1302,7 +1375,7 @@ class ResourceMonitorModal(ModalScreen):
     DEFAULT_CSS = """
     ResourceMonitorModal { align: center middle; }
     #mon-box {
-        width: 95%; height: 92%; background: #0d1117;
+        width: 98%; height: 95%; background: #0d1117;
         border: solid #1f6feb; layout: vertical;
     }
     #mon-title {
@@ -1480,7 +1553,7 @@ class ResourceMonitorModal(ModalScreen):
 class LogViewerModal(ModalScreen):
     DEFAULT_CSS = """
     LogViewerModal { align: center middle; }
-    #log-box { width: 95%; height: 90%; background: #0d1117; border: solid #238636; }
+    #log-box { width: 98%; height: 95%; background: #0d1117; border: solid #238636; }
     #log-title { background: #0f2b0f; color: #3fb950; text-style: bold; padding: 0 2; height: 1; }
     #log-tab-row {
         height: 3; background: #161b22; border-bottom: solid #30363d;
@@ -1512,7 +1585,6 @@ class LogViewerModal(ModalScreen):
     """
 
     _showing: str = "stdout"
-    _timer: Timer | None = None
     _live: bool = True
     _current_path: str = ""
 
@@ -1542,16 +1614,14 @@ class LogViewerModal(ModalScreen):
                     id="log-keys-label"
                 )
             with Horizontal(id="log-footer-row"):
-                refresh_txt = f"↻ auto-refresh every {LOG_REFRESH_SECS}s" if self._live else "📁 static log (job finished)"
-                yield Label(refresh_txt, id="refresh-label")
+                live_txt = "🔴 Live" if self._live else "📁 Static"
+                yield Label(live_txt, id="refresh-label")
                 yield Button("↻  Refresh  [r]",   id="btn-log-refresh")
                 yield Button("✏  Editor  [e]",     id="btn-open-editor")
                 yield Button("✕  Close  [Esc]",    id="btn-log-close")
 
     def on_mount(self) -> None:
         self._show_stream("stdout")
-        if self._live:
-            self._timer = self.set_interval(LOG_REFRESH_SECS, self._auto_refresh)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
@@ -1573,8 +1643,6 @@ class LogViewerModal(ModalScreen):
         elif event.key == "end":       self.query_one("#log-content", RichLog).scroll_end(animate=False)
 
     def _close(self) -> None:
-        if self._timer:
-            self._timer.stop()
         self.dismiss()
 
     def _pick_editor(self) -> None:
@@ -1597,17 +1665,28 @@ class LogViewerModal(ModalScreen):
         # This avoids all terminal ownership conflicts with nvim/vim.
         self.app.request_open_editor_and_exit(binary, path)
 
-    def _auto_refresh(self) -> None:
-        self._show_stream(self._showing)
+    # ── Log helpers ─────────────────────────────────────────────────────────
 
     @work(thread=True)
     def _show_stream(self, which: str) -> None:
+        """Load and display a log stream (runs in a background thread)."""
         self._showing = which
-        path    = self._stdout_path if which == "stdout" else self._stderr_path
-        content = tail_file(path)
+        path = self._stdout_path if which == "stdout" else self._stderr_path
+
+        if not path or not os.path.exists(path):
+            msg = f"(File not found: {path})" if path else "(No path available)"
+            self.app.call_from_thread(self._apply_log_content, which, path, msg)
+            return
+
+        try:
+            content = tail_file(path)
+        except Exception as e:
+            content = f"(Error reading file: {e})"
+
         self.app.call_from_thread(self._apply_log_content, which, path, content)
 
     def _apply_log_content(self, which: str, path: str, content: str) -> None:
+        """Render log content into the RichLog widget (runs on the UI thread)."""
         self._current_path = path
         self.query_one("#btn-show-stdout", Button).set_class(which == "stdout", "active-log")
         self.query_one("#btn-show-stderr", Button).set_class(which == "stderr", "active-log")
@@ -1618,6 +1697,8 @@ class LogViewerModal(ModalScreen):
             log.write(Text(content, style="dim italic"))
             return
         for line in content.splitlines():
+            if not line:
+                continue
             lower = line.lower()
             if any(k in lower for k in ("error", "exception", "traceback", "fatal", "oom")):
                 log.write(Text(line, style="bold red"))
@@ -1704,14 +1785,44 @@ class ActionBar(Static):
 
 class HistoryTable(DataTable):
     """Panel 4: searchable history of all past jobs."""
-    COLS = [
+    COLS_FULL = [
         ("JOBID", 10), ("NAME", 22), ("USER", 12), ("PARTITION", 11),
         ("STATE", 11), ("CPUs", 5), ("MEM", 7), ("GPUs", 5),
         ("FIRST SEEN", 18), ("LAST SEEN", 18),
     ]
+    COLS_COMPACT = [
+        ("JOBID", 10), ("NAME", 20), ("STATE", 11),
+        ("GPUs", 5), ("FIRST SEEN", 18), ("LAST SEEN", 18),
+    ]
+    COLS_MINIMAL = [
+        ("JOBID", 10), ("NAME", 18), ("STATE", 11), ("LAST SEEN", 18),
+    ]
+
+    COLS = COLS_FULL
+
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
 
     def on_mount(self) -> None:
         self.cursor_type = "row"
+        self._build_columns()
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self._rebuild_columns()
+
+    def _build_columns(self) -> None:
+        self.COLS = self._pick_cols()
+        for col, width in self.COLS:
+            self.add_column(col, width=width, key=col)
+
+    def _rebuild_columns(self) -> None:
+        self.clear(columns=True)
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
 
@@ -1732,18 +1843,22 @@ class HistoryTable(DataTable):
             if ft and not any(ft in str(v).lower() for v in e.values()):
                 continue
             st = e.get("state", "")
-            self.add_row(
-                Text(e["jobid"],     style="bold yellow"),
-                Text(e["name"],      style="white"),
-                Text(e["user"],      style="white"),
-                Text(e["partition"], style="white"),
-                Text(st,             style=state_style(st)),
-                Text(e.get("cpus", ""), style="white"),
-                Text(e.get("mem",  ""), style="white"),
-                Text(e.get("gpus", ""), style="cyan"),
-                Text(e.get("first_seen", ""), style="dim"),
-                Text(e.get("last_seen",  ""), style="dim"),
-            )
+            col_keys = [col for col, _ in self.COLS]
+            def hv(key, _e=e, _st=st):
+                vals = {
+                    "JOBID":      Text(_e["jobid"],              style="bold yellow"),
+                    "NAME":       Text(_e["name"],               style="white"),
+                    "USER":       Text(_e["user"],               style="white"),
+                    "PARTITION":  Text(_e["partition"],          style="white"),
+                    "STATE":      Text(_st,                      style=state_style(_st)),
+                    "CPUs":       Text(_e.get("cpus", ""),       style="white"),
+                    "MEM":        Text(_e.get("mem",  ""),       style="white"),
+                    "GPUs":       Text(_e.get("gpus", ""),       style="cyan"),
+                    "FIRST SEEN": Text(_e.get("first_seen", ""), style="dim"),
+                    "LAST SEEN":  Text(_e.get("last_seen",  ""), style="dim"),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[hv(k) for k in col_keys])
             if e["jobid"] == selected_jobid:
                 new_cursor = idx
             idx += 1
@@ -1757,15 +1872,57 @@ class HistoryTable(DataTable):
 
 
 class SqueueTable(DataTable):
-    COLS = [
+    # Full set shown on wide terminals (≥ 140 cols)
+    COLS_FULL = [
         ("JOBID", 10), ("PARTITION", 11), ("NAME", 20), ("USER", 12),
-        ("STATE", 11), ("TIME", 8), ("TIME LEFT", 9), ("CPUs", 5),
-        ("MEM", 7), ("GPUs", 5), ("NODES", 12), ("REASON", 24),
+        ("STATE", 11), ("TIME", 8), ("TIME LEFT", 9), ("EST. START", 13),
+        ("CPUs", 5), ("MEM", 7), ("GPUs", 5), ("NODES", 12), ("REASON", 24),
     ]
+    # Compact set for narrow terminals (< 140 cols)
+    COLS_COMPACT = [
+        ("JOBID", 10), ("NAME", 18), ("USER", 10),
+        ("STATE", 11), ("TIME LEFT", 9), ("EST. START", 13),
+        ("GPUs", 5), ("REASON", 20),
+    ]
+    # Minimal set for very narrow terminals (< 90 cols)
+    COLS_MINIMAL = [
+        ("JOBID", 10), ("NAME", 16), ("STATE", 11), ("TIME LEFT", 9),
+    ]
+
+    COLS = COLS_FULL   # active set, updated on resize
+
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
+
     def on_mount(self) -> None:
         self.cursor_type = "row"
+        self._build_columns()
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self._rebuild_columns()
+
+    def _build_columns(self) -> None:
+        self.COLS = self._pick_cols()
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
+
+    def _rebuild_columns(self) -> None:
+        """Rebuild columns after a resize — preserves cursor row."""
+        cur = self.cursor_row
+        self.clear(columns=True)
+        for col, width in self.COLS:
+            self.add_column(col, width=width, key=col)
+        # Re-request a data refresh from the app
+        try:
+            self.app.query_one(SqueueTable).refresh()
+        except Exception:
+            pass
 
     def refresh_jobs(self, jobs: list[dict]) -> None:
         selected_jobid = None
@@ -1778,12 +1935,21 @@ class SqueueTable(DataTable):
             rs = "bold yellow" if j["user"] == MY_USER else "white"
             st = j["state"]
             def c(val, extra=""): return Text(val, style=f"{rs} {extra}".strip())
-            self.add_row(
-                c(j["jobid"]), c(j["partition"]), c(j["name"]), c(j["user"]),
-                Text(st, style=state_style(st)),
-                c(j["time"]), c(j["time_left"]), c(j["cpus"]),
-                c(j["mem"]),  c(j["gpus"]),      c(j["nodes"]), c(j["reason"]),
-            )
+            est = j.get("est_start", "")
+            col_keys = [col for col, _ in self.COLS]
+            def cv(key):
+                vals = {
+                    "JOBID": c(j["jobid"]), "PARTITION": c(j["partition"]),
+                    "NAME": c(j["name"]),   "USER": c(j["user"]),
+                    "STATE": Text(st, style=state_style(st)),
+                    "TIME": c(j["time"]),   "TIME LEFT": c(j["time_left"]),
+                    "EST. START": Text(est or "—", style="cyan" if est else "dim"),
+                    "CPUs": c(j["cpus"]),   "MEM": c(j["mem"]),
+                    "GPUs": c(j["gpus"]),   "NODES": c(j["nodes"]),
+                    "REASON": c(j["reason"]),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[cv(k) for k in col_keys])
             if j["jobid"] == selected_jobid: new_cursor = idx
         if new_cursor is not None: self.move_cursor(row=new_cursor)
 
@@ -1799,13 +1965,44 @@ class SqueueTable(DataTable):
 
 
 class MyJobsTable(DataTable):
-    COLS = [
+    COLS_FULL = [
         ("JOBID", 10), ("NAME", 24), ("STATE", 11), ("TIME", 10),
-        ("TIME LEFT", 10), ("CPUs", 5), ("MEM", 8), ("GPUs", 8),
-        ("NODES", 16), ("REASON", 28),
+        ("TIME LEFT", 10), ("EST. START", 13), ("CPUs", 5), ("MEM", 8),
+        ("GPUs", 8), ("NODES", 16), ("REASON", 28),
     ]
+    COLS_COMPACT = [
+        ("JOBID", 10), ("NAME", 20), ("STATE", 11),
+        ("TIME LEFT", 10), ("EST. START", 13), ("GPUs", 5), ("REASON", 20),
+    ]
+    COLS_MINIMAL = [
+        ("JOBID", 10), ("NAME", 18), ("STATE", 11), ("TIME LEFT", 10),
+    ]
+
+    COLS = COLS_FULL
+
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
+
     def on_mount(self) -> None:
         self.cursor_type = "row"
+        self._build_columns()
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self._rebuild_columns()
+
+    def _build_columns(self) -> None:
+        self.COLS = self._pick_cols()
+        for col, width in self.COLS:
+            self.add_column(col, width=width, key=col)
+
+    def _rebuild_columns(self) -> None:
+        self.clear(columns=True)
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
 
@@ -1820,24 +2017,30 @@ class MyJobsTable(DataTable):
             self.add_row(
                 Text("—", style="dim"),
                 Text(f"No jobs found for user {MY_USER}", style="dim italic"),
-                *[Text("", style="dim")] * 8,
+                *[Text("", style="dim")] * (len(self.COLS) - 2),
             )
             return
         new_cursor = None
         for idx, j in enumerate(mine):
             st = j["state"]
-            self.add_row(
-                Text(j["jobid"],     style="bold yellow"),
-                Text(j["name"],      style="bold yellow"),
-                Text(st,             style=state_style(st)),
-                Text(j["time"],      style="yellow"),
-                Text(j["time_left"], style="yellow"),
-                Text(j["cpus"],      style="yellow"),
-                Text(j["mem"],       style="yellow"),
-                Text(j["gpus"],      style="yellow"),
-                Text(j["nodes"],     style="yellow"),
-                Text(j["reason"],    style="dim"),
-            )
+            est = j.get("est_start", "")
+            col_keys = [col for col, _ in self.COLS]
+            def mv(key):
+                vals = {
+                    "JOBID": Text(j["jobid"],     style="bold yellow"),
+                    "NAME":  Text(j["name"],      style="bold yellow"),
+                    "STATE": Text(st,             style=state_style(st)),
+                    "TIME":  Text(j["time"],      style="yellow"),
+                    "TIME LEFT": Text(j["time_left"], style="yellow"),
+                    "EST. START": Text(est or "—", style="cyan" if est else "dim"),
+                    "CPUs":  Text(j["cpus"],      style="yellow"),
+                    "MEM":   Text(j["mem"],       style="yellow"),
+                    "GPUs":  Text(j["gpus"],      style="yellow"),
+                    "NODES": Text(j["nodes"],     style="yellow"),
+                    "REASON":Text(j["reason"],    style="dim"),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[mv(k) for k in col_keys])
             if j["jobid"] == selected_jobid: new_cursor = idx
         if new_cursor is not None: self.move_cursor(row=new_cursor)
 
@@ -1853,31 +2056,62 @@ class MyJobsTable(DataTable):
 
 
 class SinfoTable(DataTable):
-    COLS = [
+    COLS_FULL = [
         ("NODE", 16), ("PARTITION", 12), ("STATE", 10),
         ("CPU A/I/O/T", 12), ("MEM (MB)", 10), ("GRES", 20), ("FEATURES", 30),
     ]
+    COLS_COMPACT = [
+        ("NODE", 14), ("PARTITION", 11), ("STATE", 10),
+        ("CPU A/I/O/T", 12), ("GRES", 18),
+    ]
+    COLS_MINIMAL = [
+        ("NODE", 14), ("STATE", 10), ("GRES", 16),
+    ]
+
+    COLS = COLS_FULL
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self.clear(columns=True)
+            for col, width in self.COLS:
+                self.add_column(col, width=width, key=col)
+
     STATE_COLORS = {
         "idle": "green", "alloc": "bold green", "mix": "yellow",
         "down": "bold red", "drain": "red", "drng": "red",
     }
     def on_mount(self) -> None:
+        self.COLS = self._pick_cols()
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
 
     def refresh_nodes(self, nodes: list[dict]) -> None:
         self.clear()
         if not nodes:
-            self.add_row(*[Text("n/a", style="dim")] * 7); return
+            self.add_row(*[Text("n/a", style="dim")] * len(self.COLS)); return
         for n in nodes:
             st = n["state"]
             color = self.STATE_COLORS.get(st.lower().rstrip("*"), "white")
-            self.add_row(
-                Text(n["node"], style="white"),     Text(n["partition"], style="white"),
-                Text(st, style=color),              Text(n["cpu_aiotd"], style="white"),
-                Text(n["mem"], style="white"),      Text(n["gres"], style="cyan"),
-                Text(n["features"], style="dim"),
-            )
+            col_keys = [col for col, _ in self.COLS]
+            def sv(key, _n=n, _st=st, _c=color):
+                vals = {
+                    "NODE":        Text(_n["node"],      style=f"bold {_c}"),
+                    "PARTITION":   Text(_n["partition"], style="white"),
+                    "STATE":       Text(_st,             style=_c),
+                    "CPU A/I/O/T": Text(_n["cpu_aiotd"], style="white"),
+                    "MEM (MB)":    Text(_n["mem"],       style="white"),
+                    "GRES":        Text(_n["gres"],      style="cyan"),
+                    "FEATURES":    Text(_n["features"],  style="dim"),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[sv(k) for k in col_keys])
 
 
 class EventLog(RichLog):
@@ -1971,11 +2205,11 @@ class HistoryStatsPanel(Static):
         ts = datetime.now().strftime("%H:%M:%S  %d/%m/%Y")
 
         # ── RESUMEN GENERAL ──
-        sep("RESUMEN GENERAL")
+        sep("GENERAL SUMMARY")
         line(f"  Total jobs in history : {stats['total']}", "white")
         line(f"  Completed successfully    : {stats['succeeded']}  ({stats['success_rt']}%)", "bold green")
         line(f"  Failed / Timeout        : {stats['failed']}    ({stats['fail_rt']}%)", "bold red")
-        line(f"  Otros (running/pending) : {stats['other']}", "dim")
+        line(f"  Others (running/pending) : {stats['other']}", "dim")
 
         # ── SUCCESS/FAILURE BAR ──
         sep()
@@ -1992,12 +2226,12 @@ class HistoryStatsPanel(Static):
         log.write(full_bar)
 
         # ── RECURSOS CONSUMIDOS ──
-        sep("RECURSOS CONSUMIDOS (jobs COMPLETED)")
-        line(f"  GPU-horas totales       : {stats['gpu_hours']:.1f} h", "bold #f0883e")
-        line(f"  CPU-horas totales       : {stats['cpu_hours']:.1f} h", "#79c0ff")
+        sep("RESOURCES USED (jobs COMPLETED)")
+        line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", "bold #f0883e")
+        line(f"  CPU-hours total       : {stats['cpu_hours']:.1f} h", "#79c0ff")
         avg_h = int(stats["avg_wall_hrs"])
         avg_m = int((stats["avg_wall_hrs"] - avg_h) * 60)
-        line(f"  Time medio per job    : {avg_h}h {avg_m:02d}m", "cyan")
+        line(f"  Average time per job    : {avg_h}h {avg_m:02d}m", "cyan")
 
         # ── BY PARTITION ──
         sep("JOBS BY PARTITION")
@@ -2037,7 +2271,7 @@ class HistoryStatsPanel(Static):
             line(f"  Max in one day: {max_day} jobs", "dim")
 
         # ── ESTADOS DESGLOSADOS ──
-        sep("DESGLOSE DE ESTADOS")
+        sep("STATES")
         state_cols = {
             "COMPLETED": "bold green", "CD": "bold green",
             "FAILED": "bold red",      "F":  "bold red",
@@ -2085,8 +2319,9 @@ class SlurmDashboard(App):
     StatsBar {
         height: 1; background: #161b22; color: #c9d1d9;
         padding: 0 1; border-bottom: solid #30363d;
+        overflow: hidden;
     }
-    Tabs { background: #161b22; border-bottom: solid #30363d; }
+    Tabs { background: #161b22; border-bottom: solid #30363d; overflow-x: auto; }
     Tab { color: #8b949e; }
     Tab.-active { color: #58a6ff; background: #0d1117; text-style: bold; }
     DataTable { background: #0d1117; color: #c9d1d9; border: solid #30363d; }
@@ -2096,7 +2331,7 @@ class SlurmDashboard(App):
     DataTable > .datatable--cursor { background: #1f6feb; color: white; }
     DataTable > .datatable--even-row { background: #0d1117; }
     DataTable > .datatable--odd-row  { background: #161b22; }
-    EventLog { background: #0d1117; border: solid #30363d; height: 12; }
+    EventLog { background: #0d1117; border: solid #30363d; height: 8; max-height: 14; }
     #main-layout { height: 1fr; }
     #log-label {
         background: #161b22; color: #58a6ff;
@@ -2108,7 +2343,7 @@ class SlurmDashboard(App):
         align: left middle; padding: 0 2;
     }
     #history-search {
-        width: 40; border: solid #30363d; background: #0d1117;
+        width: 1fr; max-width: 42; border: solid #30363d; background: #0d1117;
         color: #c9d1d9; margin-right: 2; height: 1;
     }
     #history-hint   { color: #484f58; margin-left: 2; }
@@ -2406,7 +2641,7 @@ class SlurmDashboard(App):
         cached_sl = entry.get("submit_line", "") if entry else ""
         ok, msg   = False, ""
 
-        # Try cached submit_line first
+        # Strategy 1+2: try cached submit_line first
         if cached_sl:
             try:
                 args = shlex.split(cached_sl)
@@ -2418,7 +2653,7 @@ class SlurmDashboard(App):
             except Exception as e:
                 ok, msg = False, str(e)
 
-        # If no cache or it failed, search in sacct + scontrol
+        # If no cache or it failed, query sacct + scontrol
         if not ok:
             fresh_sl = get_submit_line(jobid)
             if fresh_sl:
@@ -2427,25 +2662,27 @@ class SlurmDashboard(App):
                     if args and args[0] != "sbatch":
                         args = ["sbatch"] + args
                     ok, msg = run_sbatch(args)
-                    # Save for next time
+                    # Cache the submit line for future reruns
                     if ok and entry:
                         entry["submit_line"] = fresh_sl
                         save_history(self._history)
                 except Exception as e:
                     ok, msg = False, str(e)
 
-        # Last fallback: scontrol requeue
+        # Last fallback: scontrol requeue (job must still exist in Slurm)
         if not ok:
-            proc = subprocess.run(
-                ["scontrol", "requeue", jobid],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=20,
-            )
+            with open(os.devnull, "r") as _dn:
+                proc = subprocess.run(
+                    ["scontrol", "requeue", jobid],
+                    stdin=_dn, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                    timeout=20, close_fds=True,
+                )
             if proc.returncode == 0:
                 ok  = True
-                msg = f"Job {jobid} requeued → vuelve a PENDING"
+                msg = f"Job {jobid} requeued → back to PENDING"
             else:
-                # Construir mensaje de error informativo
+                # Build informative error message
                 requeue_err = proc.stderr.strip()
                 script_info = get_job_script_info(jobid)
                 hint = ""
@@ -2492,7 +2729,7 @@ class SlurmDashboard(App):
                         severity="warning", timeout=3); return
         entry = next((e for e in self._history if e["jobid"] == jobid), None)
         state = entry.get("state", "") if entry else ""
-        # Refresca estado live desde squeue
+        # Refresh live state from squeue
         live_jobs = {j["jobid"]: j for j in parse_squeue()}
         live = live_jobs.get(jobid)
         if live:
@@ -2500,7 +2737,7 @@ class SlurmDashboard(App):
         if not self._is_live_state(state):
             self.notify(
                 f"Job {jobid} is not active ({state or 'UNKNOWN'}). "
-                "Solo se puede monitorizar jobs RUNNING/PENDING.",
+                "Only RUNNING/PENDING jobs can be monitored.",
                 severity="warning", timeout=5)
             return
         name = live["name"] if live else (entry.get("name", "") if entry else "")
@@ -2510,7 +2747,7 @@ class SlurmDashboard(App):
         jobid = self._get_selected_jobid()
         if not jobid:
             self.notify("Select a job first", severity="warning"); return
-        # Si estamos en History, delegate to the specific helper
+        # If on the History tab, delegate to its specific helper
         if self._active_tab == "tab-history":
             self._open_history_monitor(); return
         job_name, state = "", ""
@@ -2607,7 +2844,7 @@ class SlurmDashboard(App):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         updates = []
         for jid, real_state in resolved.items():
-            # Normalise "CANCELLED by 1234" → "CANCELLED"
+            # Normalise "CANCELLED by 1234" → "CANCELLED" (sacct format)
             real_state = real_state.split()[0].upper()
             # Skip if sacct returned a live state too (job genuinely still running)
             if real_state in live_states:
@@ -2648,6 +2885,15 @@ class SlurmDashboard(App):
         nodes = parse_sinfo()
         stats = compute_stats(jobs)
         ts    = datetime.now().strftime("%H:%M:%S")
+
+        # Fetch estimated start times for PENDING jobs and merge into job dicts
+        pending_ids = {j["jobid"] for j in jobs
+                       if j["state"] in ("PD", "PENDING")}
+        if pending_ids:
+            estimates = get_start_estimates()
+            for j in jobs:
+                if j["jobid"] in estimates:
+                    j["est_start"] = estimates[j["jobid"]]
         events = []
         cur_states = {j["jobid"]: j["state"] for j in jobs}
         for jid, st in cur_states.items():
@@ -2852,6 +3098,11 @@ def _fix_stdin_blocking() -> None:
 
 
 if __name__ == "__main__":
+    import shutil as _shutil
+    if not _shutil.which("squeue"):
+        print("Error: Slurm is not available in your $PATH.")
+        print("Make sure to run 'module load slurm' (or equivalent) before launching the dashboard.")
+        sys.exit(1)
     _fix_stdin_blocking()
     app = SlurmDashboard()
     app.run()
