@@ -11,6 +11,7 @@ import os
 import sys
 import re
 import json
+import shutil
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
@@ -36,6 +37,24 @@ HISTORY_FILE      = Path.home() / ".slurm_dashboard_history.json"
 EVENT_LOG_FILE    = Path.home() / ".slurm_dashboard_events.log"
 MAX_EVENT_LOG     = 5000   # max lines kept in the event log file
 MAX_HISTORY       = 500   # max entries to keep
+HISTORY_ONLY_MINE = True   # persist only jobs owned by MY_USER (see upsert_history)
+DEFAULT_PARTITIONS: list[str] = []
+
+# Job ids and node names are interpolated into the argv of external commands
+# (scancel, scontrol, ssh...).  They come from parsed command output, so they
+# are validated before use: a value starting with "-" would otherwise be
+# swallowed as an option by the target program (argument injection).
+_JOBID_RE    = re.compile(r"^\d+(?:\+\d+)?(?:_(?:\d+|\[[0-9,\-:%]+\]))?(?:\.[A-Za-z0-9_]+)?$")
+_NODENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def is_valid_jobid(jobid: str) -> bool:
+    """True for '123', '123_4', '123_[0-9]', '123.batch', '123+0'."""
+    return bool(jobid) and bool(_JOBID_RE.match(str(jobid).strip()))
+
+
+def is_valid_nodename(node: str) -> bool:
+    return bool(node) and len(node) <= 255 and bool(_NODENAME_RE.match(str(node).strip()))
 
 # ──────────────────────────────────────────────
 #  JOB HISTORY
@@ -44,16 +63,26 @@ def load_history() -> list[dict]:
     if not HISTORY_FILE.exists():
         return []
     try:
-        return json.loads(HISTORY_FILE.read_text())
+        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
     except Exception:
         return []
+    # The file may have been hand-edited or written by an older version:
+    # drop anything that is not a usable record instead of crashing later.
+    if not isinstance(data, list):
+        return []
+    return [e for e in data if isinstance(e, dict) and e.get("jobid")]
 
 def save_history(history: list[dict]) -> None:
     """Atomic write: write to a temp file then rename, so the history JSON
-    is never left in a truncated/corrupt state if the process is killed."""
+    is never left in a truncated/corrupt state if the process is killed.
+    Created with mode 0600 — it records job names, working directories and
+    log paths, which should not be world-readable on a shared cluster."""
     tmp = HISTORY_FILE.with_suffix(".tmp")
     try:
-        tmp.write_text(json.dumps(history[-MAX_HISTORY:], indent=2))
+        payload = json.dumps(history[-MAX_HISTORY:], indent=2)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
         tmp.replace(HISTORY_FILE)
     except Exception:
         try:
@@ -65,7 +94,8 @@ def save_history(history: list[dict]) -> None:
 def append_event_log(ts: str, msg: str) -> None:
     """Append a single event line to the persistent log file."""
     try:
-        with open(EVENT_LOG_FILE, "a", encoding="utf-8") as f:
+        fd = os.open(EVENT_LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
         # Trim to MAX_EVENT_LOG lines when file exceeds 1 MB
         try:
@@ -95,26 +125,30 @@ def upsert_history(history: list[dict], job: dict, paths: dict | None = None) ->
     Insert or update a job record in history.
     Keyed by jobid. Updates state, end time, and log paths if provided.
     """
-    entry = next((e for e in history if e["jobid"] == job["jobid"]), None)
+    entry = next((e for e in history if e.get("jobid") == job["jobid"]), None)
     now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     if entry is None:
         entry = {
             "jobid":     job["jobid"],
-            "name":      job["name"],
-            "user":      job["user"],
-            "partition": job["partition"],
-            "cpus":      job["cpus"],
-            "mem":       job["mem"],
-            "gpus":      job["gpus"],
-            "state":     job["state"],
+            "name":      job.get("name", ""),
+            "user":      job.get("user", ""),
+            "partition": job.get("partition", ""),
+            "cpus":      job.get("cpus", ""),
+            "mem":       job.get("mem", ""),
+            "gpus":      job.get("gpus", ""),
+            "state":     job.get("state", ""),
             "first_seen": now,
             "last_seen":  now,
             "stdout":    "",
             "stderr":    "",
         }
         history.append(entry)
+        # Keep the in-memory list bounded too: save_history() only truncates
+        # what it writes, so without this the list grew for the whole session.
+        if len(history) > MAX_HISTORY:
+            del history[:-MAX_HISTORY]
     else:
-        entry["state"]     = job["state"]
+        entry["state"]     = job.get("state", entry.get("state", ""))
         entry["last_seen"] = now
     if paths:
         entry["stdout"] = paths.get("stdout", entry.get("stdout", ""))
@@ -166,16 +200,22 @@ def sacct_final_state(jobids: list[str]) -> dict[str, str]:
     Handles suffixes like 123.batch, 123.extern, array jobs 123_4.
     Prioritises terminal states over live states when multiple rows exist.
     """
+    jobids = [j for j in jobids if is_valid_jobid(j)]
     if not jobids:
         return {}
-    ids_arg = ",".join(jobids)
-    try:
-        out = run_out([
-            "sacct", "-j", ids_arg, "-n", "-P",
-            "--format=JobID,State"
-        ])
-    except Exception:
-        return {}
+    # sacct is called with every id that vanished from squeue at once; on a
+    # busy cluster that list can blow past ARG_MAX, so query it in batches.
+    out_chunks = []
+    for i in range(0, len(jobids), 50):
+        ids_arg = ",".join(jobids[i:i + 50])
+        try:
+            out_chunks.append(run_out([
+                "sacct", "-j", ids_arg, "-n", "-P",
+                "--format=JobID,State"
+            ]))
+        except Exception:
+            continue
+    out = "\n".join(out_chunks)
 
     _priority = {
         "OUT_OF_MEMORY": 100, "NODE_FAIL": 95, "FAILED": 90,
@@ -215,15 +255,18 @@ def sacct_final_state(jobids: list[str]) -> dict[str, str]:
 
 
 def parse_squeue() -> list[dict]:
-
-    fmt = "%i|%P|%j|%u|%T|%M|%L|%C|%m|%b|%R|%N"
+    # %j (job name) is deliberately LAST: Slurm allows "|" inside a job name,
+    # and an unbounded split would then shift every following field (the user
+    # column in particular, which the cancel/hold guards rely on).
+    # split("|", 11) keeps the remainder — the full name — in the last element.
+    fmt = "%i|%P|%u|%T|%M|%L|%C|%m|%b|%R|%N|%j"
     out = run_out(["squeue", f"--format={fmt}", "--noheader"])
     jobs = []
     for line in out.strip().splitlines():
-        parts = line.split("|")
+        parts = line.split("|", 11)
         if len(parts) < 12:
             continue
-        raw_gpu = parts[9]
+        raw_gpu = parts[8]
         gpu_val = ""
         m = re.search(r"\d+", raw_gpu)
         if m and "gpu" in raw_gpu.lower():
@@ -231,16 +274,16 @@ def parse_squeue() -> list[dict]:
         jobs.append({
             "jobid":     parts[0],
             "partition": parts[1],
-            "name":      parts[2][:20],
-            "user":      parts[3],
-            "state":     parts[4],
-            "time":      parts[5],
-            "time_left": parts[6],
-            "cpus":      parts[7],
-            "mem":       parts[8],
+            "user":      parts[2],
+            "state":     parts[3],
+            "time":      parts[4],
+            "time_left": parts[5],
+            "cpus":      parts[6],
+            "mem":       parts[7],
             "gpus":      gpu_val,
-            "reason":    parts[10] if parts[10] != "None" else "",
-            "nodes":     parts[11],
+            "reason":    parts[9] if parts[9] != "None" else "",
+            "nodes":     parts[10],
+            "name":      parts[11][:20],
             "est_start": "",          # filled in by refresh_data()
         })
     return jobs
@@ -314,7 +357,7 @@ def parse_sinfo() -> list[dict]:
     out = run_out(["sinfo", f"--format={fmt}", "--noheader"])
     nodes = []
     for line in out.strip().splitlines():
-        parts = line.split("|")
+        parts = line.split("|", 6)   # %f (features) is last — keep it whole
         if len(parts) < 7:
             continue
         nodes.append({
@@ -341,7 +384,7 @@ def compute_stats(jobs: list[dict]) -> dict:
             "by_state": dict(by_state), "running_gpus": running_gpus}
 
 def get_job_log_paths(jobid: str) -> dict[str, str]:
-    out = run_out(["scontrol", "show", "job", jobid])
+    out = run_out(["scontrol", "show", "job", jobid]) if is_valid_jobid(jobid) else ""
     def extract(key: str) -> str:
         m = re.search(rf"{key}=(\S+)", out)
         return m.group(1) if m else ""
@@ -392,6 +435,11 @@ def tail_file(path: str, n: int = LOG_TAIL_LINES) -> str:
             f.seek(-chunk, 2)
             data = f.read()
         lines = data.decode("utf-8", errors="replace").splitlines()
+        # Seeking to a fixed offset usually lands mid-line; that first
+        # fragment is not a real line, so drop it (unless we read the
+        # whole file, in which case every line is complete).
+        if chunk < size and lines:
+            lines = lines[1:]
         return "\n".join(lines[-n:])
     except Exception as e:
         return f"(Error reading file: {e})"
@@ -402,27 +450,46 @@ def tail_file(path: str, n: int = LOG_TAIL_LINES) -> str:
 # ──────────────────────────────────────────────
 def get_job_nodes(jobid: str) -> list[str]:
     """Return list of nodes assigned to a job."""
+    if not is_valid_jobid(jobid):
+        return []
     out = run_out(["squeue", "-j", jobid, "-h", "--format=%N"])
     nodelist = out.strip()
     if not nodelist or nodelist in ("(None)", "N/A", ""):
         return []
     try:
         exp = run_out(["scontrol", "show", "hostnames", nodelist])
-        return [n.strip() for n in exp.strip().splitlines() if n.strip()]
+        names = [n.strip() for n in exp.strip().splitlines() if n.strip()]
     except Exception:
-        return [nodelist]
+        names = [nodelist]
+    # Only hand well-formed hostnames to ssh_cmd().
+    return [n for n in names if is_valid_nodename(n)]
 
 def ssh_cmd(node: str, cmd: str, timeout: int = 8) -> str:
-    """Execute a command on a remote node via SSH (no password)."""
+    """Execute a read-only command on a compute node via SSH (key auth only).
+
+    Notes:
+      * The node name is validated first — an unvalidated name beginning with
+        "-" would be parsed by ssh as an option (e.g. -oProxyCommand=...).
+      * stdin is redirected to /dev/null: ssh otherwise reads the terminal
+        that Textual owns, stealing keystrokes and tripping BlockingIOError.
+      * StrictHostKeyChecking=accept-new trusts a *new* host but still refuses
+        a host whose key changed, which is what detects a MITM.  "no" accepted
+        changed keys silently.
+    """
+    if not is_valid_nodename(node):
+        return ""
     try:
-        r = subprocess.run(
-            ["ssh", "-o", "StrictHostKeyChecking=no",
-             "-o", "ConnectTimeout=5",
-             "-o", "BatchMode=yes",
-             node, cmd],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=timeout
-        )
+        with open(os.devnull, "r") as devnull:
+            r = subprocess.run(
+                ["ssh", "-n",
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "ConnectTimeout=5",
+                 "-o", "BatchMode=yes",
+                 "--", node, cmd],
+                stdin=devnull,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=timeout, close_fds=True,
+            )
         return r.stdout
     except Exception:
         return ""
@@ -478,15 +545,20 @@ def get_node_cpu_mem(node: str) -> dict:
             # Second read to compute delta (approx with a sleep)
             pass
         if line.startswith("mem_total="):
-            kv = dict(item.split("=") for item in line.split() if "=" in item)
-            mt = int(kv.get("mem_total", 0))
-            ma = int(kv.get("mem_avail", 0))
+            # split("=", 1): a token like "a=b=c" would otherwise raise
+            # ValueError here and kill the whole monitor worker.
+            kv = dict(item.split("=", 1) for item in line.split() if "=" in item)
+            try:
+                mt = int(kv.get("mem_total", 0))
+                ma = int(kv.get("mem_avail", 0))
+            except ValueError:
+                continue
             result["mem_total_kb"] = mt
             result["mem_used_kb"]  = mt - ma
             result["mem_pct"] = int((mt - ma) / mt * 100) if mt > 0 else 0
         if line.startswith("load="):
             result["load"] = line[5:].strip().split(",")[0].strip()
-    # CPU% via mpstat si available, sino top -bn1
+    # CPU% via top -bn1 (mpstat is not available everywhere)
     cpu_out = ssh_cmd(node,
         "top -bn2 -d0.2 | grep '^%Cpu' | tail -1 | "
         "awk '{print 100-$8}' 2>/dev/null || echo 0")
@@ -500,11 +572,13 @@ def get_job_sstat(jobid: str) -> dict:
     """
     Fetches job resource usage via sstat (running jobs only).
     """
+    result = {"avg_cpu": "N/A", "max_rss": "N/A", "tasks": "N/A"}
+    if not is_valid_jobid(jobid):
+        return result
     out = run_out([
         "sstat", "-j", jobid, "--noheader",
         "--format=AveCPU,MaxRSS,MaxVMSize,NTasks"
     ])
-    result = {"avg_cpu": "N/A", "max_rss": "N/A", "tasks": "N/A"}
     line = out.strip().splitlines()[0] if out.strip() else ""
     if line:
         parts = line.split()
@@ -555,6 +629,8 @@ def get_submit_line(jobid: str) -> str:
     2. scontrol show job Command= (available while the job exists in Slurm)
     Returns the .sh script path or the full sbatch line, or "" if not found.
     """
+    if not is_valid_jobid(jobid):
+        return ""
     # Source 1: sacct SubmitLine
     try:
         out = run_out(["sacct", "-j", jobid, "-X", "-n", "-P", "--format=SubmitLine"])
@@ -572,7 +648,7 @@ def get_submit_line(jobid: str) -> str:
         if m:
             script = m.group(1)
             if script and script != "(null)" and os.path.isfile(script):
-                return f"sbatch {script}"
+                return f"sbatch {shlex.quote(script)}"
     except Exception:
         pass
 
@@ -584,6 +660,8 @@ def get_job_script_info(jobid: str) -> dict:
     to allow building an sbatch command manually.
     """
     info = {"command": "", "workdir": "", "extra": ""}
+    if not is_valid_jobid(jobid):
+        return info
     try:
         out = run_out(["scontrol", "show", "job", jobid])
         m_cmd  = re.search(r"Command=(\S+)", out)
@@ -593,6 +671,26 @@ def get_job_script_info(jobid: str) -> dict:
     except Exception:
         pass
     return info
+
+def build_sbatch_args(submit_line: str) -> list[str] | None:
+    """Turn a recovered submit line into a safe argv for sbatch.
+
+    The line comes from `sacct --format=SubmitLine`, from `scontrol` or from
+    the on-disk history JSON, so it is not trusted to be an sbatch invocation.
+    Only a line that *is* an sbatch call is accepted; anything else returns
+    None instead of being "fixed up" by prepending sbatch, which silently
+    turned a line such as `/bin/sh -c '...'` into submission arguments.
+    """
+    try:
+        args = shlex.split(submit_line)
+    except ValueError:      # unbalanced quotes
+        return None
+    if not args:
+        return None
+    if os.path.basename(args[0]) != "sbatch":
+        return None
+    return ["sbatch"] + args[1:]
+
 
 def run_sbatch(args: list[str]) -> tuple[bool, str]:
     """Launch sbatch with the given args. Returns (ok, message)."""
@@ -616,26 +714,21 @@ def rerun_history_job(jobid: str) -> tuple[bool, str]:
       2. scontrol Command= -> sbatch <script>
       3. scontrol requeue  -> back to PENDING (only jobs still in Slurm)
     """
+    if not is_valid_jobid(jobid):
+        return False, f"Invalid job id: {jobid!r}"
+
     # Strategy 1 + 2: get_submit_line already combines both sources
     submit_line = get_submit_line(jobid)
     if submit_line:
-        try:
-            args = shlex.split(submit_line)
-            if args and args[0] == "sbatch":
-                return run_sbatch(args)
-            # If it is just the script path, wrap it in sbatch
-            if args and os.path.isfile(args[0]):
-                return run_sbatch(["sbatch"] + args)
-        except Exception as e:
-            return False, str(e)
+        args = build_sbatch_args(submit_line)
+        if args:
+            return run_sbatch(args)
 
     # Strategy 3: scontrol requeue
-    proc = subprocess.run(
-        ["scontrol", "requeue", jobid],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, timeout=20,
-    )
-    if proc.returncode == 0:
+    # run() keeps stdin off the terminal and never raises on timeout /
+    # missing binary, unlike the bare subprocess.run() this used to be.
+    _, req_err = run(["scontrol", "requeue", jobid], timeout=20)
+    if not req_err.strip():
         return True, f"Job {jobid} requeued → back to PENDING"
 
     return False, (
@@ -654,7 +747,6 @@ def compute_history_stats(history: list[dict]) -> dict:
     Computes aggregate metrics from the job history.
     """
     from collections import Counter
-    import math
 
     if not history:
         return {}
@@ -675,7 +767,7 @@ def compute_history_stats(history: list[dict]) -> dict:
     # ── by partition ──
     by_partition = Counter(e.get("partition", "unknown") for e in history)
 
-    # ── GPU-horas aproximadas (solo jobs COMPLETED) ──
+    # ── approximate GPU-hours (COMPLETED jobs only) ──
     # Uses last_seen - first_seen as a proxy for actual execution time
     gpu_hours = 0.0
     cpu_hours = 0.0
@@ -744,9 +836,9 @@ def get_partitions() -> list[str]:
     try:
         out = run_out(["sinfo", "-h", "-o", "%P"])
         parts = [p.strip().rstrip("*") for p in out.splitlines() if p.strip()]
-        return parts if parts else DEFAULT_PARTITIONS
+        return parts if parts else list(DEFAULT_PARTITIONS)
     except Exception:
-        return DEFAULT_PARTITIONS
+        return list(DEFAULT_PARTITIONS)
 
 # Tokens that Slurm expands in the log file name
 _SLURM_TOKENS = re.compile(r'%[jJuUxXaAnNtT]')
@@ -843,7 +935,7 @@ def _safe_log_path(raw: str, script: str) -> tuple[str, str]:
       - log_path : safe path to pass to --output/--error
       - dir_to_create : base directory to create before sbatch
 
-    Reglas:
+    Rules:
       * %j/%J/%u/etc. are valid ONLY in the file name,
         never in a directory component.
       * If the user put a token in the directory (e.g. logs/%j/out.log),
@@ -868,13 +960,9 @@ def _safe_log_path(raw: str, script: str) -> tuple[str, str]:
     # resolve_existing_slurm_log() will find the actual file when opening logs.
     # dir_to_create = deepest static ancestor that contains no tokens.
     log_path = os.path.join(parent, fname)
-    static_parent = parent
-    for part in Path(parent).parts:
-        if _SLURM_TOKENS.search(part):
-            break
-        static_parent = str(Path(static_parent))
 
-    # Walk up until we reach a token-free directory
+    # Walk down until we hit the first directory component holding a token:
+    # everything above it is static and can safely be created ahead of sbatch.
     parts_list = list(Path(parent).parts)
     clean_parts = []
     for p in parts_list:
@@ -924,33 +1012,38 @@ def submit_job(template: dict) -> tuple[bool, str]:
     return run_sbatch(args)
 
 def expand_array_job(jobid_base: str) -> list[dict]:
+    if not is_valid_jobid(jobid_base):
+        return []
     try:
+        # JobName last: it is user-supplied and may contain "|".
         out = run_out([
             "sacct", "-j", jobid_base, "-X", "-n", "-P",
-            "--format=JobID,JobName,State,ExitCode,Elapsed,NodeList,Start,End"
+            "--format=JobID,State,ExitCode,Elapsed,NodeList,Start,End,JobName"
         ])
     except Exception:
         return []
     tasks = []
     for line in out.splitlines():
-        parts = line.strip().split("|")
+        parts = line.strip().split("|", 7)
         if len(parts) < 8:
             continue
         jid = parts[0].strip()
         if not jid or jid == jobid_base:
             continue
+        raw_state = parts[1].strip().split()
         tasks.append({
-            "jobid": jid, "name": parts[1].strip(),
-            "state": parts[2].strip().split()[0], "exitcode": parts[3].strip(),
-            "elapsed": parts[4].strip(), "nodes": parts[5].strip(),
-            "start": parts[6].strip(), "end": parts[7].strip(),
+            "jobid": jid, "name": parts[7].strip(),
+            "state": raw_state[0] if raw_state else "UNKNOWN",
+            "exitcode": parts[2].strip(),
+            "elapsed": parts[3].strip(), "nodes": parts[4].strip(),
+            "start": parts[5].strip(), "end": parts[6].strip(),
         })
     return tasks
 
 def get_dependency_tree(jobid: str, depth: int = 0, visited: set = None) -> list:
     if visited is None:
         visited = set()
-    if jobid in visited or depth > 5:
+    if jobid in visited or depth > 5 or not is_valid_jobid(jobid):
         return []
     visited.add(jobid)
     try:
@@ -966,9 +1059,17 @@ def get_dependency_tree(jobid: str, depth: int = 0, visited: set = None) -> list
     result = [(depth, jobid, state, dep_str, name)]
     if dep_str and dep_str not in ("(null)", "(none)"):
         for dep in dep_str.split(","):
-            m = re.match(r"(afterok|afterany|afternotok|after):(\d+)", dep.strip())
+            # Slurm writes "afterok:12:13" for several ids on one clause, and
+            # also uses aftercorr/afterburstbuffer — the old pattern matched
+            # only the first id of the four "after*" types it knew about.
+            m = re.match(
+                r"(?:afterok|afterany|afternotok|aftercorr|afterburstbuffer|after)"
+                r":([\d:_+]+)", dep.strip())
             if m:
-                result += get_dependency_tree(m.group(2), depth + 1, visited)
+                for dep_id in m.group(1).split(":"):
+                    dep_id = dep_id.split("+")[0]
+                    if dep_id:
+                        result += get_dependency_tree(dep_id, depth + 1, visited)
     return result
 
 # ──────────────────────────────────────────────
@@ -1035,14 +1136,32 @@ class SubmitJobModal(ModalScreen):
             self.dismiss(None)
         elif bid == "btn-submit-run":
             vals = self._get_values()
-            ok, msg = submit_job(vals)
-            status = self.query_one("#submit-status", Label)
-            if ok:
-                status.update(f"[bold green]✓ Submitted: {msg}[/]")
-                self.app.notify(f"Job submitted: {msg}", timeout=5)
-                self.set_timer(2.0, lambda: self.dismiss(vals))
-            else:
-                status.update(f"[bold red]✗ Error: {msg}[/]")
+            if not vals.get("script"):
+                self.query_one("#submit-status", Label).update(
+                    "[bold red]✗ A script path is required[/]")
+                return
+            # sbatch has a 30 s timeout — running it inline froze the whole
+            # TUI until the controller answered.
+            self.query_one("#submit-status", Label).update("[dim]Submitting…[/]")
+            event.button.disabled = True
+            self._worker_submit(vals)
+
+    @work(thread=True)
+    def _worker_submit(self, vals: dict) -> None:
+        ok, msg = submit_job(vals)
+        self.app.call_from_thread(self._submit_done, vals, ok, msg)
+
+    def _submit_done(self, vals: dict, ok: bool, msg: str) -> None:
+        if not self.is_attached:
+            return
+        status = self.query_one("#submit-status", Label)
+        self.query_one("#btn-submit-run", Button).disabled = False
+        if ok:
+            status.update(f"[bold green]✓ Submitted: {msg}[/]")
+            self.app.notify(f"Job submitted: {msg}", timeout=5)
+            self.set_timer(2.0, lambda: self.dismiss(vals))
+        else:
+            status.update(f"[bold red]✗ Error: {msg}[/]")
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -1085,6 +1204,10 @@ class ArrayJobModal(ModalScreen):
         self.app.call_from_thread(self._populate, tasks)
 
     def _populate(self, tasks: list[dict]) -> None:
+        # The worker may finish after the user pressed Esc; querying a
+        # detached screen raises NoMatches inside call_from_thread.
+        if not self.is_attached:
+            return
         tbl = self.query_one("#array-table", DataTable)
         if not tasks:
             self.query_one("#array-title", Label).update(
@@ -1158,6 +1281,8 @@ class DependencyTreeModal(ModalScreen):
         self.app.call_from_thread(self._render_dep_tree, tree)
 
     def _render_dep_tree(self, tree: list) -> None:
+        if not self.is_attached:
+            return
         log = self.query_one("#dep-log", RichLog)
         STATE_ICONS = {
             "RUNNING":   ("▶", "bold cyan"),
@@ -1255,13 +1380,30 @@ class JobDetailModal(ModalScreen):
         self._jobid = jobid
 
     def compose(self) -> ComposeResult:
-        out = run_out(["scontrol", "show", "job", self._jobid])
-        if not out.strip():
-            out = f"Could not retrieve info for job {self._jobid}.\n(Already finished?)"
+        # The scontrol call used to run here, blocking the UI thread for up
+        # to the 10 s command timeout before the modal could even be drawn.
         with Vertical(id="detail-box"):
             yield Label(f"  📋  scontrol show job {self._jobid}", id="detail-title")
-            yield TextArea(out, id="detail-text", read_only=True)
+            yield TextArea("Loading…", id="detail-text", read_only=True)
             yield Button("✕  Close  [Esc]", id="detail-close")
+
+    def on_mount(self) -> None:
+        self._worker_load()
+
+    @work(thread=True)
+    def _worker_load(self) -> None:
+        if is_valid_jobid(self._jobid):
+            out = run_out(["scontrol", "show", "job", self._jobid])
+        else:
+            out = f"Invalid job id: {self._jobid!r}"
+        self.app.call_from_thread(self._apply_detail, out)
+
+    def _apply_detail(self, out: str) -> None:
+        if not self.is_attached:
+            return
+        if not out.strip():
+            out = f"Could not retrieve info for job {self._jobid}.\n(Already finished?)"
+        self.query_one("#detail-text", TextArea).text = out
 
     def on_button_pressed(self, _) -> None:
         self.dismiss()
@@ -1288,13 +1430,11 @@ def detect_editors() -> list[tuple[str, str]]:
     ]
     found = []
     for label, binary in candidates:
-        try:
-            r = subprocess.run(["which", binary], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, text=True, timeout=3)
-            if r.returncode == 0 and r.stdout.strip():
-                found.append((label, r.stdout.strip()))
-        except Exception:
-            pass
+        # shutil.which: no subprocess, so this stays cheap at import time and
+        # cannot inherit the terminal's stdin the way `which` did.
+        path = shutil.which(binary)
+        if path:
+            found.append((label, path))
     return found
 
 AVAILABLE_EDITORS: list[tuple[str, str]] = detect_editors()
@@ -1346,7 +1486,7 @@ class EditorPickerModal(ModalScreen):
         if btns: btns[0].focus()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
+        bid = event.button.id or ""
         if bid == "btn-picker-cancel":
             self.dismiss(None); return
         if bid.startswith("editor--"):
@@ -1454,8 +1594,10 @@ class ResourceMonitorModal(ModalScreen):
     def _do_refresh(self) -> None:
         self._fetch_resources(self._jobid)
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="monitor")
     def _fetch_resources(self, jobid: str) -> None:
+        # exclusive: each refresh SSHes to up to 8 nodes twice with an 8 s
+        # timeout, which routinely exceeds the 8 s refresh interval.
         lines: list[tuple[str, str]] = []  # (text, style)
 
         def sep(title: str = "") -> None:
@@ -1543,6 +1685,8 @@ class ResourceMonitorModal(ModalScreen):
         self.app.call_from_thread(self._apply_monitor, lines, ts)
 
     def _apply_monitor(self, lines: list[tuple[str, str]], ts: str) -> None:
+        if not self.is_attached:
+            return
         self.query_one("#mon-refresh-lbl", Label).update(f"  ↻ {ts}")
         log = self.query_one("#mon-content", RichLog)
         log.clear()
@@ -1587,6 +1731,8 @@ class LogViewerModal(ModalScreen):
     _showing: str = "stdout"
     _live: bool = True
     _current_path: str = ""
+    _timer: Timer | None = None
+    LIVE_REFRESH_SECS = 5
 
     def __init__(self, jobid: str, stdout_path: str, stderr_path: str,
                  job_name: str = "", state: str = "", live: bool = True) -> None:
@@ -1610,7 +1756,8 @@ class LogViewerModal(ModalScreen):
             yield RichLog(id="log-content", highlight=True, markup=False, wrap=True)
             with Horizontal(id="log-keys-row"):
                 yield Label(
-                    "  Tab/S+Tab: buttons  │  ↑↓: scroll  │  PgUp/PgDn  │  r: refresh  │  e: open editor  │  Esc: close",
+                    "  Tab/S+Tab: buttons  │  ↑↓: scroll  │  PgUp/PgDn  │  r: refresh  │  e: open editor  │  Esc: close"
+                    + (f"  │  auto-tail {self.LIVE_REFRESH_SECS}s" if self._live else ""),
                     id="log-keys-label"
                 )
             with Horizontal(id="log-footer-row"):
@@ -1622,6 +1769,11 @@ class LogViewerModal(ModalScreen):
 
     def on_mount(self) -> None:
         self._show_stream("stdout")
+        # The header advertised a live tail but nothing ever re-read the file;
+        # only a manual "r" refreshed it.
+        if self._live:
+            self._timer = self.set_interval(
+                self.LIVE_REFRESH_SECS, lambda: self._show_stream(self._showing))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
@@ -1643,6 +1795,9 @@ class LogViewerModal(ModalScreen):
         elif event.key == "end":       self.query_one("#log-content", RichLog).scroll_end(animate=False)
 
     def _close(self) -> None:
+        if self._timer:
+            self._timer.stop()
+            self._timer = None
         self.dismiss()
 
     def _pick_editor(self) -> None:
@@ -1667,7 +1822,7 @@ class LogViewerModal(ModalScreen):
 
     # ── Log helpers ─────────────────────────────────────────────────────────
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="logview")
     def _show_stream(self, which: str) -> None:
         """Load and display a log stream (runs in a background thread)."""
         self._showing = which
@@ -1687,6 +1842,8 @@ class LogViewerModal(ModalScreen):
 
     def _apply_log_content(self, which: str, path: str, content: str) -> None:
         """Render log content into the RichLog widget (runs on the UI thread)."""
+        if not self.is_attached:
+            return
         self._current_path = path
         self.query_one("#btn-show-stdout", Button).set_class(which == "stdout", "active-log")
         self.query_one("#btn-show-stderr", Button).set_class(which == "stderr", "active-log")
@@ -1783,6 +1940,25 @@ class ActionBar(Static):
         else:
             lbl.update("Job: -")
 
+def cell_by_col(table, name: str) -> str | None:
+    """Read the selected row's cell for column `name`.
+
+    The tables swap between FULL/COMPACT/MINIMAL column sets depending on the
+    terminal width, so a fixed column index points at a different field on a
+    narrow terminal.  Returns None when the column is not currently shown.
+    """
+    if table is None or table.row_count == 0:
+        return None
+    cols = [c for c, _ in getattr(table, "COLS", [])]
+    if name not in cols:
+        return None
+    try:
+        val = str(table.get_cell_at((table.cursor_row, cols.index(name)))).strip()
+    except Exception:
+        return None
+    return val or None
+
+
 class HistoryTable(DataTable):
     """Panel 4: searchable history of all past jobs."""
     COLS_FULL = [
@@ -1825,8 +2001,14 @@ class HistoryTable(DataTable):
         self.clear(columns=True)
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
+        # clear(columns=True) also drops every row: without this the table
+        # stayed empty after a resize until the tab was re-entered.
+        self.populate(*self._last_render)
+
+    _last_render: tuple = ([], "")
 
     def populate(self, history: list[dict], filter_text: str = "") -> None:
+        self._last_render = (history, filter_text)
         # Preserve cursor position across refreshes
         selected_jobid = None
         if self.row_count > 0:
@@ -1846,10 +2028,10 @@ class HistoryTable(DataTable):
             col_keys = [col for col, _ in self.COLS]
             def hv(key, _e=e, _st=st):
                 vals = {
-                    "JOBID":      Text(_e["jobid"],              style="bold yellow"),
-                    "NAME":       Text(_e["name"],               style="white"),
-                    "USER":       Text(_e["user"],               style="white"),
-                    "PARTITION":  Text(_e["partition"],          style="white"),
+                    "JOBID":      Text(_e.get("jobid", ""),      style="bold yellow"),
+                    "NAME":       Text(_e.get("name", ""),       style="white"),
+                    "USER":       Text(_e.get("user", ""),       style="white"),
+                    "PARTITION":  Text(_e.get("partition", ""),  style="white"),
                     "STATE":      Text(_st,                      style=state_style(_st)),
                     "CPUs":       Text(_e.get("cpus", ""),       style="white"),
                     "MEM":        Text(_e.get("mem",  ""),       style="white"),
@@ -1859,16 +2041,14 @@ class HistoryTable(DataTable):
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[hv(k) for k in col_keys])
-            if e["jobid"] == selected_jobid:
+            if e.get("jobid") == selected_jobid:
                 new_cursor = idx
             idx += 1
         if new_cursor is not None:
             self.move_cursor(row=new_cursor)
 
     def get_selected_jobid(self) -> str | None:
-        if self.row_count == 0: return None
-        try: return str(self.get_cell_at((self.cursor_row, 0))).strip() or None
-        except: return None
+        return cell_by_col(self, "JOBID")
 
 
 class SqueueTable(DataTable):
@@ -1912,19 +2092,19 @@ class SqueueTable(DataTable):
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
 
+    _last_jobs: list[dict] = []
+
     def _rebuild_columns(self) -> None:
-        """Rebuild columns after a resize — preserves cursor row."""
-        cur = self.cursor_row
+        """Rebuild columns after a resize, then redraw the cached rows."""
         self.clear(columns=True)
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
-        # Re-request a data refresh from the app
-        try:
-            self.app.query_one(SqueueTable).refresh()
-        except Exception:
-            pass
+        # The old version only called .refresh() (a repaint, not a reload),
+        # so the table sat empty until the next 3 s poll.
+        self.refresh_jobs(self._last_jobs)
 
     def refresh_jobs(self, jobs: list[dict]) -> None:
+        self._last_jobs = jobs
         selected_jobid = None
         if self.row_count > 0:
             try: selected_jobid = str(self.get_cell_at((self.cursor_row, 0))).strip()
@@ -1954,14 +2134,14 @@ class SqueueTable(DataTable):
         if new_cursor is not None: self.move_cursor(row=new_cursor)
 
     def get_selected_jobid(self) -> str | None:
-        if self.row_count == 0: return None
-        try: return str(self.get_cell_at((self.cursor_row, 0))).strip() or None
-        except: return None
+        return cell_by_col(self, "JOBID")
 
     def get_selected_user(self) -> str | None:
-        if self.row_count == 0: return None
-        try: return str(self.get_cell_at((self.cursor_row, 3))).strip() or None
-        except: return None
+        # index 3 used to be hardcoded here: on a terminal narrower than 140
+        # columns that cell is STATE (or TIME LEFT), so the owner check in
+        # scancel/hold/release compared a job state against $USER and refused
+        # every action on the user's own jobs.
+        return cell_by_col(self, "USER")
 
 
 class MyJobsTable(DataTable):
@@ -2001,18 +2181,22 @@ class MyJobsTable(DataTable):
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
 
+    _last_jobs: list[dict] = []
+
     def _rebuild_columns(self) -> None:
         self.clear(columns=True)
         for col, width in self.COLS:
             self.add_column(col, width=width, key=col)
+        self.refresh_jobs(self._last_jobs)
 
     def refresh_jobs(self, jobs: list[dict]) -> None:
+        self._last_jobs = jobs
         selected_jobid = None
         if self.row_count > 0:
             try: selected_jobid = str(self.get_cell_at((self.cursor_row, 0))).strip()
             except: pass
         self.clear()
-        mine = [j for j in jobs if j["user"] == MY_USER]
+        mine = [j for j in jobs if j.get("user") == MY_USER]
         if not mine:
             self.add_row(
                 Text("—", style="dim"),
@@ -2045,11 +2229,8 @@ class MyJobsTable(DataTable):
         if new_cursor is not None: self.move_cursor(row=new_cursor)
 
     def get_selected_jobid(self) -> str | None:
-        if self.row_count == 0: return None
-        try:
-            val = str(self.get_cell_at((self.cursor_row, 0))).strip()
-            return val if val != "—" else None
-        except: return None
+        val = cell_by_col(self, "JOBID")
+        return val if val != "—" else None
 
     def get_selected_user(self) -> str | None:
         return MY_USER
@@ -2075,6 +2256,8 @@ class SinfoTable(DataTable):
         if w >= 90:  return self.COLS_COMPACT
         return self.COLS_MINIMAL
 
+    _last_nodes: list[dict] = []
+
     def on_resize(self, event) -> None:
         new_cols = self._pick_cols()
         if new_cols != self.COLS:
@@ -2082,6 +2265,7 @@ class SinfoTable(DataTable):
             self.clear(columns=True)
             for col, width in self.COLS:
                 self.add_column(col, width=width, key=col)
+            self.refresh_nodes(self._last_nodes)
 
     STATE_COLORS = {
         "idle": "green", "alloc": "bold green", "mix": "yellow",
@@ -2093,6 +2277,7 @@ class SinfoTable(DataTable):
             self.add_column(col, width=width, key=col)
 
     def refresh_nodes(self, nodes: list[dict]) -> None:
+        self._last_nodes = nodes
         self.clear()
         if not nodes:
             self.add_row(*[Text("n/a", style="dim")] * len(self.COLS)); return
@@ -2204,7 +2389,7 @@ class HistoryStatsPanel(Static):
 
         ts = datetime.now().strftime("%H:%M:%S  %d/%m/%Y")
 
-        # ── RESUMEN GENERAL ──
+        # ── GENERAL SUMMARY ──
         sep("GENERAL SUMMARY")
         line(f"  Total jobs in history : {stats['total']}", "white")
         line(f"  Completed successfully    : {stats['succeeded']}  ({stats['success_rt']}%)", "bold green")
@@ -2217,7 +2402,6 @@ class HistoryStatsPanel(Static):
         ok_w   = int(40 * stats["succeeded"] / total) if total else 0
         fail_w = int(40 * stats["failed"]    / total) if total else 0
         rest_w = 40 - ok_w - fail_w
-        bar    = "█" * ok_w + "█" * fail_w + "░" * rest_w
         ok_bar   = Text("█" * ok_w,   style="bold green")
         fail_bar = Text("█" * fail_w, style="bold red")
         rest_bar = Text("░" * rest_w, style="#30363d")
@@ -2225,7 +2409,7 @@ class HistoryStatsPanel(Static):
         full_bar += Text(f"  ✓ {stats['success_rt']}%  ✗ {stats['fail_rt']}%", style="white")
         log.write(full_bar)
 
-        # ── RECURSOS CONSUMIDOS ──
+        # ── RESOURCES USED ──
         sep("RESOURCES USED (jobs COMPLETED)")
         line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", "bold #f0883e")
         line(f"  CPU-hours total       : {stats['cpu_hours']:.1f} h", "#79c0ff")
@@ -2246,8 +2430,9 @@ class HistoryStatsPanel(Static):
         # ── TOP JOB NAMES ──
         sep("TOP 10 JOB NAMES")
         by_name = sorted(stats["by_name"].items(), key=lambda x: -x[1])
+        max_name = max((v for _, v in by_name), default=1) or 1
         for name, count in by_name[:10]:
-            bar_w = int(20 * count / max(v for _, v in by_name)) if by_name else 0
+            bar_w = int(20 * count / max_name)
             bar = "█" * bar_w + "░" * (20 - bar_w)
             line(f"  {name[:24]:<24}  [{bar}]  {count:>4}", "white")
 
@@ -2270,7 +2455,7 @@ class HistoryStatsPanel(Static):
                 log.write(bars_txt)
             line(f"  Max in one day: {max_day} jobs", "dim")
 
-        # ── ESTADOS DESGLOSADOS ──
+        # ── STATE BREAKDOWN ──
         sep("STATES")
         state_cols = {
             "COMPLETED": "bold green", "CD": "bold green",
@@ -2384,9 +2569,15 @@ class SlurmDashboard(App):
     TITLE = "SLURM Dashboard"
     SUB_TITLE = f"user: {MY_USER}  │  refresh: {REFRESH_INTERVAL}s"
 
-    _prev_states: dict[str, str] = {}
     _active_tab:  str = "tab-all"
-    _history:     list[dict] = []
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Instance state — these were mutable class attributes, i.e. shared by
+        # every instance of the app.
+        self._prev_states: dict[str, str] = {}
+        self._history: list[dict] = []
+        self._jobs_by_id: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -2477,7 +2668,10 @@ class SlurmDashboard(App):
         if event.input.id == "history-search":
             self._refresh_history_table(event.value)
 
-    def on_data_table_cursor_moved(self, _) -> None:
+    def on_data_table_row_highlighted(self, _) -> None:
+        # Was on_data_table_cursor_moved(): DataTable has no CursorMoved
+        # message, so the handler never ran and the selected-job labels only
+        # caught up on the next 3 s poll.  RowHighlighted is the real event.
         self._sync_action_bar()
         if self._active_tab == "tab-history":
             jobid = self.query_one(HistoryTable).get_selected_jobid()
@@ -2504,6 +2698,17 @@ class SlurmDashboard(App):
         return t.get_selected_jobid() if t else None
 
     def _get_selected_user(self) -> str | None:
+        """Owner of the selected job.
+
+        Resolved from the last squeue snapshot first: the table only shows a
+        USER column on wide terminals, and the cancel/hold/release guards must
+        not silently fail (nor pass) because a column is hidden.
+        """
+        jobid = self._get_selected_jobid()
+        if jobid:
+            job = self._jobs_by_id.get(jobid)
+            if job:
+                return job.get("user")
         t = self._get_active_table()
         return t.get_selected_user() if t else None
 
@@ -2537,7 +2742,7 @@ class SlurmDashboard(App):
         jobid = self.query_one(HistoryTable).get_selected_jobid()
         if not jobid:
             self.notify("Select a job from history first", severity="warning"); return
-        entry = next((e for e in self._history if e["jobid"] == jobid), None)
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
         if not entry:
             self.notify("Entry not found in history", severity="warning"); return
         stdout = entry.get("stdout", "")
@@ -2576,13 +2781,20 @@ class SlurmDashboard(App):
     @work(thread=True)
     def _do_fetch_logs(self, jobid: str, live: bool) -> None:
         paths = get_job_log_paths(jobid)
-        # Update history with resolved paths
-        entry = next((e for e in self._history if e["jobid"] == jobid), None)
-        if entry and (paths["stdout"] or paths["stderr"]):
-            entry["stdout"] = paths["stdout"]
-            entry["stderr"] = paths["stderr"]
-            save_history(self._history)
+        # The history list is owned by the UI thread — mutating and saving it
+        # from here raced with the 3 s refresh writing the same file.
+        self.call_from_thread(self._store_log_paths, jobid, paths)
         self.call_from_thread(self._push_log_viewer_from_paths, jobid, paths, live)
+
+    def _store_log_paths(self, jobid: str, paths: dict) -> None:
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
+        if entry and (paths.get("stdout") or paths.get("stderr")):
+            entry["stdout"] = paths.get("stdout", "")
+            entry["stderr"] = paths.get("stderr", "")
+            save_history(self._history)
+
+    def _persist_history(self) -> None:
+        save_history(self._history)
 
     def _push_log_viewer_from_paths(self, jobid: str, paths: dict, live: bool) -> None:
         if not paths["stdout"] and not paths["stderr"]:
@@ -2617,7 +2829,7 @@ class SlurmDashboard(App):
         if not jobid:
             self.notify("Select a job from History first", severity="warning")
             return
-        entry = next((e for e in self._history if e["jobid"] == jobid), None)
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
         name  = entry.get("name", "") if entry else ""
         sl    = entry.get("submit_line", "") if entry else ""
         if sl:
@@ -2632,58 +2844,56 @@ class SlurmDashboard(App):
     def _do_history_rerun(self, confirmed: bool, jobid: str) -> None:
         if not confirmed:
             return
-        self.notify(f"Resubmitiendo job {jobid}…", timeout=3)
+        self.notify(f"Resubmitting job {jobid}…", timeout=3)
         self._worker_rerun(jobid)
 
     @work(thread=True)
     def _worker_rerun(self, jobid: str) -> None:
-        entry     = next((e for e in self._history if e["jobid"] == jobid), None)
+        entry     = next((e for e in self._history if e.get("jobid") == jobid), None)
         cached_sl = entry.get("submit_line", "") if entry else ""
         ok, msg   = False, ""
 
-        # Strategy 1+2: try cached submit_line first
+        if not is_valid_jobid(jobid):
+            self.app.call_from_thread(self._rerun_fail, jobid,
+                                      f"Invalid job id: {jobid!r}")
+            return
+
+        # Strategy 1+2: try cached submit_line first.  build_sbatch_args()
+        # rejects a line that is not an sbatch call or a script path instead
+        # of prepending "sbatch" to whatever the history file happened to say.
         if cached_sl:
-            try:
-                args = shlex.split(cached_sl)
-                if not args:
-                    raise ValueError("empty submit_line")
-                if args[0] != "sbatch":
-                    args = ["sbatch"] + args
+            args = build_sbatch_args(cached_sl)
+            if args:
                 ok, msg = run_sbatch(args)
-            except Exception as e:
-                ok, msg = False, str(e)
+            else:
+                ok, msg = False, f"Cached submit line is not an sbatch command: {cached_sl!r}"
 
         # If no cache or it failed, query sacct + scontrol
         if not ok:
             fresh_sl = get_submit_line(jobid)
             if fresh_sl:
-                try:
-                    args = shlex.split(fresh_sl)
-                    if args and args[0] != "sbatch":
-                        args = ["sbatch"] + args
+                args = build_sbatch_args(fresh_sl)
+                if args:
                     ok, msg = run_sbatch(args)
                     # Cache the submit line for future reruns
                     if ok and entry:
                         entry["submit_line"] = fresh_sl
-                        save_history(self._history)
-                except Exception as e:
-                    ok, msg = False, str(e)
+                        self.app.call_from_thread(self._persist_history)
+                else:
+                    ok, msg = False, f"Recovered submit line is not an sbatch command: {fresh_sl!r}"
 
         # Last fallback: scontrol requeue (job must still exist in Slurm)
         if not ok:
-            with open(os.devnull, "r") as _dn:
-                proc = subprocess.run(
-                    ["scontrol", "requeue", jobid],
-                    stdin=_dn, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, text=True,
-                    timeout=20, close_fds=True,
-                )
-            if proc.returncode == 0:
+            # run() cannot raise: the bare subprocess.run() used here before
+            # propagated TimeoutExpired/FileNotFoundError out of the worker
+            # thread, leaving the rerun silently dead with no notification.
+            _, requeue_err = run(["scontrol", "requeue", jobid], timeout=20)
+            if not requeue_err.strip():
                 ok  = True
                 msg = f"Job {jobid} requeued → back to PENDING"
             else:
                 # Build informative error message
-                requeue_err = proc.stderr.strip()
+                requeue_err = requeue_err.strip()
                 script_info = get_job_script_info(jobid)
                 hint = ""
                 if script_info["command"] and os.path.isfile(script_info["command"]):
@@ -2727,11 +2937,11 @@ class SlurmDashboard(App):
         if not jobid:
             self.notify("Select a job from History first",
                         severity="warning", timeout=3); return
-        entry = next((e for e in self._history if e["jobid"] == jobid), None)
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
         state = entry.get("state", "") if entry else ""
-        # Refresh live state from squeue
-        live_jobs = {j["jobid"]: j for j in parse_squeue()}
-        live = live_jobs.get(jobid)
+        # Use the snapshot refreshed by the 3 s poller instead of running
+        # squeue synchronously here, which blocked the UI thread.
+        live = self._jobs_by_id.get(jobid)
         if live:
             state = live["state"]
         if not self._is_live_state(state):
@@ -2750,14 +2960,12 @@ class SlurmDashboard(App):
         # If on the History tab, delegate to its specific helper
         if self._active_tab == "tab-history":
             self._open_history_monitor(); return
-        job_name, state = "", ""
+        # Indices 2 and 4 were hardcoded here and pointed at other columns
+        # once the table switched to its compact/minimal layout.
+        job = self._jobs_by_id.get(jobid, {})
         t = self._get_active_table()
-        if t and t.row_count > 0:
-            try:
-                job_name = str(t.get_cell_at((t.cursor_row, 2))).strip()
-                state    = str(t.get_cell_at((t.cursor_row, 4))).strip()
-            except Exception:
-                pass
+        job_name = job.get("name") or cell_by_col(t, "NAME") or ""
+        state    = job.get("state") or cell_by_col(t, "STATE") or ""
         self.push_screen(ResourceMonitorModal(jobid, job_name=job_name, state=state))
 
     def action_job_scancel(self) -> None:
@@ -2765,6 +2973,9 @@ class SlurmDashboard(App):
         user  = self._get_selected_user()
         if not jobid:
             self.notify("Select a job first", severity="warning"); return
+        if user is None:
+            self.notify("Cannot determine the owner of this job — refusing to cancel",
+                        severity="error"); return
         if user != MY_USER:
             self.notify(f"Cannot cancel jobs belonging to another user ({user})",
                         severity="error"); return
@@ -2776,6 +2987,8 @@ class SlurmDashboard(App):
 
     def _do_scancel(self, confirmed: bool, jobid: str) -> None:
         if not confirmed: return
+        if not is_valid_jobid(jobid):
+            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
         _, stderr = run(["scancel", jobid])
         if stderr.strip():
             self.notify(f"scancel error: {stderr.strip()}", severity="error", timeout=6)
@@ -2790,8 +3003,13 @@ class SlurmDashboard(App):
         user  = self._get_selected_user()
         if not jobid:
             self.notify("Select a job first", severity="warning"); return
+        if user is None:
+            self.notify("Cannot determine the owner of this job — refusing to hold",
+                        severity="error"); return
         if user != MY_USER:
             self.notify("Cannot hold jobs belonging to another user", severity="error"); return
+        if not is_valid_jobid(jobid):
+            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
         _, stderr = run(["scontrol", "hold", jobid])
         if stderr.strip():
             self.notify(f"hold error: {stderr.strip()}", severity="error", timeout=6)
@@ -2805,8 +3023,13 @@ class SlurmDashboard(App):
         user  = self._get_selected_user()
         if not jobid:
             self.notify("Select a job first", severity="warning"); return
+        if user is None:
+            self.notify("Cannot determine the owner of this job — refusing to release",
+                        severity="error"); return
         if user != MY_USER:
             self.notify("Cannot release jobs belonging to another user", severity="error"); return
+        if not is_valid_jobid(jobid):
+            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
         _, stderr = run(["scontrol", "release", jobid])
         if stderr.strip():
             self.notify(f"release error: {stderr.strip()}", severity="error", timeout=6)
@@ -2857,7 +3080,7 @@ class SlurmDashboard(App):
         log     = self.query_one(EventLog)
         changed = False
         for jid, real_state, now in updates:
-            entry = next((e for e in self._history if e["jobid"] == jid), None)
+            entry = next((e for e in self._history if e.get("jobid") == jid), None)
             if entry and entry.get("state", "") != real_state:
                 old = entry.get("state", "?")
                 entry["state"]     = real_state
@@ -2879,8 +3102,10 @@ class SlurmDashboard(App):
         self._open_editor_after_exit = (binary, path)
         self.exit()
 
-    @work(thread=True)
+    @work(thread=True, exclusive=True, group="refresh")
     def refresh_data(self) -> None:
+        # exclusive: squeue/sinfo can take seconds on a loaded controller,
+        # and the 3 s timer would otherwise stack workers indefinitely.
         jobs  = parse_squeue()
         nodes = parse_sinfo()
         stats = compute_stats(jobs)
@@ -2909,6 +3134,7 @@ class SlurmDashboard(App):
         self.call_from_thread(self._apply_update, jobs, nodes, stats, ts, events)
 
     def _apply_update(self, jobs, nodes, stats, ts, events) -> None:
+        self._jobs_by_id = {j["jobid"]: j for j in jobs}
         self.query_one(StatsBar).update_stats(stats, ts)
         self.query_one(SqueueTable).refresh_jobs(jobs)
         self.query_one(MyJobsTable).refresh_jobs(jobs)
@@ -2921,19 +3147,38 @@ class SlurmDashboard(App):
         # Update history only with jobs still visible in squeue.
         # Jobs in gone_jids get their final state from sacct — skip them
         # here to avoid overwriting a final state with stale squeue data.
+        #
+        # HISTORY_ONLY_MINE: the history file is capped at MAX_HISTORY entries
+        # and the History tab is documented as "your past jobs".  Recording
+        # every job on the cluster evicted the user's own jobs within minutes
+        # on a busy system (and wrote other users' job names to disk).
+        before = len(self._history)
+        touched = False
         for j in jobs:
-            if j["jobid"] not in gone_jids:
-                self._history = upsert_history(self._history, j)
-        save_history(self._history)
+            if j["jobid"] in gone_jids:
+                continue
+            if HISTORY_ONLY_MINE and j.get("user") != MY_USER:
+                continue
+            prev = next((e for e in self._history
+                         if e.get("jobid") == j["jobid"]), None)
+            if prev is None or prev.get("state") != j.get("state"):
+                touched = True
+            self._history = upsert_history(self._history, j)
+        # Writing the full JSON every 3 s hammered $HOME (often NFS on a
+        # cluster); persist only when something actually changed.
+        if touched or len(self._history) != before:
+            save_history(self._history)
 
         # Only refresh history table if there are no pending sacct lookups.
         # If there are gone jobs, _apply_resolve_gone will do the refresh
         # once sacct returns the real final states.
-        if self._active_tab == "tab-history" and not gone_jids:
+        tracked_gone = [jid for jid in gone_jids
+                        if any(e.get("jobid") == jid for e in self._history)]
+        if self._active_tab == "tab-history" and not tracked_gone:
             self._refresh_history_table()
 
-        if gone_jids:
-            self._worker_resolve_gone(list(gone_jids))
+        if tracked_gone:
+            self._worker_resolve_gone(tracked_gone)
         for jid, old, new in events:
             if new != "GONE":
                 log.log_event(f"Job {jid}: {old} → {new}", state_style(new))
@@ -2969,7 +3214,7 @@ class SlurmDashboard(App):
         log = self.query_one(EventLog)
         changed = False
         for jid, real_state, now in updates:
-            entry = next((e for e in self._history if e["jobid"] == jid), None)
+            entry = next((e for e in self._history if e.get("jobid") == jid), None)
             if entry:
                 old_state = entry.get("state", "?")
                 entry["state"]     = real_state
@@ -3083,9 +3328,9 @@ def _exec_editor(binary: str, path: str) -> None:
 
 def _fix_stdin_blocking() -> None:
     """
-    En Python 3.9 + Textual, if the environment (HPC modules, nvcc, pipes)
-    deja stdin en O_NONBLOCK, linux_driver lanza BlockingIOError [Errno 11].
-    Forzamos stdin a modo blocking antes de arrancar la TUI.
+    On Python 3.9 + Textual, if the environment (HPC modules, nvcc, pipes)
+    leaves stdin in O_NONBLOCK, linux_driver raises BlockingIOError [Errno 11].
+    Force stdin back to blocking mode before starting the TUI.
     """
     import sys, fcntl
     try:
@@ -3094,12 +3339,11 @@ def _fix_stdin_blocking() -> None:
         if flags & os.O_NONBLOCK:
             fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
     except Exception:
-        pass  # stdin no es un fd real (ej. redirigido) — ignorar
+        pass  # stdin is not a real fd (e.g. redirected) — ignore
 
 
 if __name__ == "__main__":
-    import shutil as _shutil
-    if not _shutil.which("squeue"):
+    if not shutil.which("squeue"):
         print("Error: Slurm is not available in your $PATH.")
         print("Make sure to run 'module load slurm' (or equivalent) before launching the dashboard.")
         sys.exit(1)
