@@ -13,6 +13,7 @@ import re
 import json
 import shutil
 import configparser
+from typing import Optional
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
@@ -2464,7 +2465,7 @@ class PriorityModal(ModalScreen):
             self.dismiss(None)
 
 
-class TextPromptModal(ModalScreen[str | None]):
+class TextPromptModal(ModalScreen[Optional[str]]):
     """One-line text prompt. Returns the entered text, or None if cancelled."""
     DEFAULT_CSS = """
     TextPromptModal { align: center middle; }
@@ -2580,7 +2581,7 @@ class TemplatePickerModal(ModalScreen):
             self.dismiss(None)
 
 
-class BulkCancelModal(ModalScreen[list | None]):
+class BulkCancelModal(ModalScreen[Optional[list]]):
     """Cancel several jobs at once behind a typed confirmation."""
     DEFAULT_CSS = """
     BulkCancelModal { align: center middle; }

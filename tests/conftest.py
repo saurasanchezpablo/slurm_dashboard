@@ -33,6 +33,12 @@ def sd():
     return _load()
 
 
+@pytest.fixture(scope="session")
+def src_path():
+    """Path to the dashboard source, for static compatibility checks."""
+    return SRC
+
+
 @pytest.fixture
 def isolated(sd, tmp_path, monkeypatch):
     """Point every on-disk artefact at a per-test directory."""

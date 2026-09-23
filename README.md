@@ -146,12 +146,23 @@ notify-send "Slurm job $1 finished: $2 ($3)"
 
 ```bash
 pip install pytest
-python -m pytest          # 183 tests, no Slurm installation required
+python -m pytest          # 189 tests, no Slurm installation required
 ```
 
 Tests fake every Slurm command and drive the real TUI headlessly, so they run
 anywhere. `$HOME` and `$XDG_CONFIG_HOME` are redirected to a temporary
 directory, so running them never touches your own history or config.
+
+**Run the suite on Python 3.9 before releasing.** Login nodes often ship 3.9
+while development happens on a newer interpreter, and some incompatibilities
+(a PEP 604 `X | None` union outside an annotation, for example) only fail
+there. `tests/test_compat.py` catches the common cases statically on any
+version, but a real 3.9 run is the real check:
+
+```bash
+uv venv --python 3.9 .venv39 && uv pip install --python .venv39/bin/python textual rich pytest
+.venv39/bin/python -m pytest
+```
 
 Both files are created with mode `0600`, since they record job names, working
 directories and log paths. The history file only tracks **your own** jobs
