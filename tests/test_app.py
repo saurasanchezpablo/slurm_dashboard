@@ -595,3 +595,310 @@ class TestKeyBindings:
                                     "btn-jobs-eff", "btn-jobs-why", "btn-jobs-bulk"}
                 app.exit()
         run(scenario())
+
+
+RESV_OUTPUT = (
+    "ReservationName=maint StartTime=2026-09-24T08:00:00 "
+    "EndTime=2026-09-24T18:00:00 Nodes=node[01-10] NodeCnt=10 "
+    "PartitionName=(null) Flags=MAINT TRES=cpu=80 Users=root "
+    "Accounts=(null) State=INACTIVE\n"
+    "ReservationName=mine StartTime=2026-09-23T09:00:00 "
+    "EndTime=2026-09-30T17:00:00 Nodes=gpu[01-02] NodeCnt=2 "
+    "PartitionName=gpu Flags=IGNORE_JOBS TRES=cpu=16 Users=testuser "
+    "Accounts=proj1 State=ACTIVE"
+)
+
+
+class TestReservationsTab:
+    def test_tab_lists_reservations_and_summarises(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path,
+                       {"scontrol": RESV_OUTPUT, "sacctmgr": "proj1"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-resv"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app.query_one(sd.ReservationTable).row_count == 2
+                summary = str(app.query_one("#resv-summary", sd.Label).content)
+                assert "2 total" in summary
+                assert "1 available to you" in summary
+                assert "1 blocking maintenance" in summary
+                app.exit()
+        run(scenario())
+
+    def test_usable_reservations_are_listed_first(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path,
+                       {"scontrol": RESV_OUTPUT, "sacctmgr": "proj1"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-resv"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                # "mine" sorts above the maintenance window
+                assert [r["name"] for r in app._reservations] == ["mine", "maint"]
+                assert app._reservations[0]["_mine"] is True
+                assert app._reservations[1]["_blocks"] is True
+                app.exit()
+        run(scenario())
+
+    def test_empty_cluster_shows_placeholder(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path,
+                       {"scontrol": "No reservations in the system"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-resv"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._reservations == []
+                assert app.query_one(sd.ReservationTable).row_count == 1
+                app.exit()
+        run(scenario())
+
+    def test_narrow_terminal_renders(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path,
+                       {"scontrol": RESV_OUTPUT, "sacctmgr": "proj1"})
+
+        async def scenario():
+            async with app.run_test(size=(80, 40)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-resv"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                table = app.query_one(sd.ReservationTable)
+                assert [c for c, _ in table.COLS] == [
+                    c for c, _ in table.COLS_MINIMAL]
+                assert table.row_count == 2
+                app.exit()
+        run(scenario())
+
+
+class TestWatchlist:
+    def test_pin_persists_and_appears_on_its_tab(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one(sd.SqueueTable).move_cursor(row=0)   # job 101
+                await pilot.pause()
+                app.action_toggle_watch()
+                await pilot.pause()
+                assert app._is_pinned("101")
+                # written to disk
+                saved = sd.load_watchlist(tmp_path / "watchlist.json")
+                assert [e["jobid"] for e in saved] == ["101"]
+                # and shown on the watchlist tab with live state
+                app.query_one("Tabs").active = "tab-watch"
+                await pilot.pause()
+                table = app.query_one(sd.WatchlistTable)
+                assert table.row_count == 1
+                assert table.get_selected_jobid() == "101"
+                summary = str(app.query_one("#watch-summary", sd.Label).content)
+                assert "1 pinned" in summary and "1 running" in summary
+                app.exit()
+        run(scenario())
+
+    def test_toggle_unpins(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one(sd.SqueueTable).move_cursor(row=0)
+                await pilot.pause()
+                app.action_toggle_watch()
+                await pilot.pause()
+                app.action_toggle_watch()
+                await pilot.pause()
+                assert not app._is_pinned("101")
+                assert sd.load_watchlist(tmp_path / "watchlist.json") == []
+                app.exit()
+        run(scenario())
+
+    def test_pin_marker_never_corrupts_the_job_id(self, sd, monkeypatch, tmp_path):
+        """The ★ goes on NAME; JOBID is parsed back out for every action."""
+        app = make_app(sd, monkeypatch, tmp_path)
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                table = app.query_one(sd.SqueueTable)
+                table.move_cursor(row=0)
+                await pilot.pause()
+                app.action_toggle_watch()
+                await pilot.pause()
+                assert table.get_selected_jobid() == "101"      # not "★ 101"
+                assert app._get_selected_user() == "testuser"
+                name = sd.cell_by_col(table, "NAME")
+                assert name.startswith("★")
+                app.exit()
+        run(scenario())
+
+    def test_pins_survive_a_restart(self, sd, monkeypatch, tmp_path):
+        path = tmp_path / "watchlist.json"
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", path)
+        sd.save_watchlist([{"jobid": "103", "name": "prep", "added": "2026-01-01"}],
+                          path)
+        app = make_app(sd, monkeypatch, tmp_path)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                assert app._is_pinned("103")
+                app.query_one("Tabs").active = "tab-watch"
+                await pilot.pause()
+                assert app.query_one(sd.WatchlistTable).row_count == 1
+                app.exit()
+        run(scenario())
+
+    def test_unknown_state_resolved_from_sacct(self, sd, monkeypatch, tmp_path):
+        """A pinned job that left the queue and is not in history."""
+        path = tmp_path / "watchlist.json"
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", path)
+        sd.save_watchlist([{"jobid": "900", "name": "old", "added": "2026-01-01"}],
+                          path)
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": "900|TIMEOUT\n"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-watch"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert app._watch_state_for("900") == "TIMEOUT"
+                app.exit()
+        run(scenario())
+
+    def test_clear_finished_keeps_live_jobs(self, sd, monkeypatch, tmp_path):
+        path = tmp_path / "watchlist.json"
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", path)
+        sd.save_watchlist([
+            {"jobid": "101", "name": "train", "added": "x"},   # still running
+            {"jobid": "900", "name": "old", "added": "x"},     # finished
+        ], path)
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": "900|COMPLETED\n"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-watch"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                app.action_clear_finished_watch()
+                await pilot.pause()
+                assert [e["jobid"] for e in app._watchlist] == ["101"]
+                assert [e["jobid"] for e in sd.load_watchlist(path)] == ["101"]
+                app.exit()
+        run(scenario())
+
+    def test_pressing_p_toggles(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one(sd.SqueueTable).focus()
+                await pilot.press("p")
+                await pilot.pause()
+                assert app._is_pinned("101")
+                app.exit()
+        run(scenario())
+
+    def test_action_bar_shows_pin_state(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+        monkeypatch.setattr(sd, "WATCHLIST_FILE", tmp_path / "watchlist.json")
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                app.query_one(sd.SqueueTable).move_cursor(row=0)
+                await pilot.pause()
+                app.action_toggle_watch()
+                await pilot.pause()
+                label = str(app.query_one("#selected-label", sd.Label).content)
+                assert "📌" in label and "101" in label
+                app.exit()
+        run(scenario())
+
+    def test_new_tabs_are_reachable_by_number(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path, {"scontrol": RESV_OUTPUT})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                app.query_one(sd.SqueueTable).focus()
+                await pilot.press("7")
+                await pilot.pause()
+                assert app._active_tab == "tab-resv"
+                await pilot.press("8")
+                await pilot.pause()
+                assert app._active_tab == "tab-watch"
+                app.exit()
+        run(scenario())
+
+
+class TestReservationCountdowns:
+    def test_labels_refresh_without_requerying_slurm(self, sd, monkeypatch, tmp_path):
+        """Countdowns must stay current while the tab sits open, but each
+        repaint must not cost another scontrol call."""
+        app = make_app(sd, monkeypatch, tmp_path,
+                       {"scontrol": RESV_OUTPUT, "sacctmgr": "proj1"})
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                app.query_one("Tabs").active = "tab-resv"
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                before = len([c for c in app._calls
+                              if c[:3] == ["scontrol", "show", "reservation"]])
+                assert before >= 1
+                app._rerender_reservations()
+                app._rerender_reservations()
+                await pilot.pause()
+                after = len([c for c in app._calls
+                             if c[:3] == ["scontrol", "show", "reservation"]])
+                assert after == before          # no extra controller traffic
+                assert app.query_one(sd.ReservationTable).row_count == 2
+                app.exit()
+        run(scenario())

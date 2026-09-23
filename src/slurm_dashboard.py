@@ -41,6 +41,7 @@ DEFAULT_PARTITIONS: list[str] = []
 CONFIG_DIR  = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "slurm_dashboard"
 CONFIG_FILE = CONFIG_DIR / "config.ini"
 TEMPLATE_FILE = CONFIG_DIR / "templates.json"
+WATCHLIST_FILE = CONFIG_DIR / "watchlist.json"
 
 # Defaults, and the schema used to coerce values read from the INI file.
 # INI is used rather than TOML because tomllib only exists on Python 3.11+
@@ -1646,6 +1647,201 @@ def get_node_info_scontrol(node: str) -> dict:
         "gpu_alloc":   gpu_num(gres_used),
         "reason":      fields.get("Reason", ""),
     }
+
+
+# ──────────────────────────────────────────────
+#  TIME HELPERS
+# ──────────────────────────────────────────────
+def parse_slurm_datetime(text: str):
+    """datetime from a Slurm timestamp, or None for Unknown/N/A/(null)."""
+    text = (text or "").strip()
+    if not text or text.upper() in ("UNKNOWN", "N/A", "(NULL)", "NONE", "INVALID"):
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def humanize_delta(seconds: float) -> str:
+    """Compact duration: '3d 4h', '5h 20m', '45m', '30s'."""
+    seconds = int(abs(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+# ──────────────────────────────────────────────
+#  RESERVATIONS
+# ──────────────────────────────────────────────
+def _split_list_field(value: str) -> list:
+    """Slurm writes an empty list as '(null)' or 'none'."""
+    value = (value or "").strip()
+    if not value or value.lower() in ("(null)", "none", "n/a"):
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def parse_reservations() -> list:
+    """Cluster reservations from `scontrol show reservation -o`."""
+    out = run_out(["scontrol", "show", "reservation", "-o"])
+    reservations = []
+    for line in out.strip().splitlines():
+        line = line.strip()
+        # scontrol says "No reservations in the system" when there are none.
+        if not line or line.lower().startswith("no reservations"):
+            continue
+        fields = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
+        name = fields.get("ReservationName", "").strip()
+        if not name:
+            continue
+        reservations.append({
+            "name":       name,
+            "state":      fields.get("State", "").strip(),
+            "start_time": fields.get("StartTime", "").strip(),
+            "end_time":   fields.get("EndTime", "").strip(),
+            "duration":   fields.get("Duration", "").strip(),
+            "nodes":      fields.get("Nodes", "").strip(),
+            "node_cnt":   fields.get("NodeCnt", "").strip(),
+            "core_cnt":   fields.get("CoreCnt", "").strip(),
+            "partition":  fields.get("PartitionName", "").strip(),
+            "features":   fields.get("Features", "").strip(),
+            "flags":      _split_list_field(fields.get("Flags", "")),
+            "users":      _split_list_field(fields.get("Users", "")),
+            "groups":     _split_list_field(fields.get("Groups", "")),
+            "accounts":   _split_list_field(fields.get("Accounts", "")),
+            "tres":       fields.get("TRES", "").strip(),
+        })
+    return reservations
+
+
+def get_my_accounts() -> list:
+    """Accounts this user belongs to, for matching against reservations."""
+    accounts = []
+    out = run_out(["sacctmgr", "-n", "-P", "show", "assoc",
+                   f"user={MY_USER}", "format=Account"])
+    for line in out.strip().splitlines():
+        acct = line.strip()
+        if acct and acct not in accounts:
+            accounts.append(acct)
+    if not accounts:
+        # sacctmgr is not always readable by ordinary users; sshare is.
+        share = get_fairshare()
+        if share.get("account"):
+            accounts.append(share["account"])
+    return accounts
+
+
+def reservation_is_mine(res: dict, user: str, accounts=None) -> bool:
+    """True when this user may submit into the reservation.
+
+    A maintenance window that merely blocks the cluster is not "mine", which
+    is the distinction that matters when a job will not start.
+    """
+    accounts = accounts or []
+    if user and user in res.get("users", []):
+        return True
+    if any(a in res.get("accounts", []) for a in accounts if a):
+        return True
+    return False
+
+
+def reservation_status(res: dict, now=None):
+    """(label, style) describing where a reservation sits in time."""
+    now = now or datetime.now()
+    start = parse_slurm_datetime(res.get("start_time", ""))
+    end = parse_slurm_datetime(res.get("end_time", ""))
+    if start and now < start:
+        return (f"starts in {humanize_delta((start - now).total_seconds())}", "cyan")
+    if start and end and start <= now <= end:
+        return (f"active, {humanize_delta((end - now).total_seconds())} left",
+                "bold green")
+    if end and now > end:
+        return ("ended", "dim")
+    state = (res.get("state") or "").upper()
+    if state == "ACTIVE":
+        return ("active", "bold green")
+    return (state.lower() or "unknown", "white")
+
+
+def reservation_blocks_jobs(res: dict) -> bool:
+    """MAINT reservations without IGNORE_JOBS hold the nodes hostage."""
+    flags = [f.upper() for f in res.get("flags", [])]
+    return "MAINT" in flags and "IGNORE_JOBS" not in flags
+
+
+# ──────────────────────────────────────────────
+#  WATCHLIST
+# ──────────────────────────────────────────────
+def load_watchlist(path=None) -> list:
+    path = path or WATCHLIST_FILE
+    try:
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    seen = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        jobid = str(entry.get("jobid", "")).strip()
+        if not jobid or jobid in seen or not is_valid_jobid(jobid):
+            continue
+        seen.add(jobid)
+        out.append({
+            "jobid": jobid,
+            "name":  str(entry.get("name", "")),
+            "added": str(entry.get("added", "")),
+        })
+    return out
+
+
+def save_watchlist(items: list, path=None) -> bool:
+    path = path or WATCHLIST_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(items, indent=2))
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def toggle_watch(items: list, jobid: str, name: str = ""):
+    """Pin or unpin a job. Returns (items, is_now_pinned)."""
+    jobid = str(jobid or "").strip()
+    if not is_valid_jobid(jobid):
+        return items, False
+    for i, entry in enumerate(items):
+        if entry.get("jobid") == jobid:
+            del items[i]
+            return items, False
+    items.append({
+        "jobid": jobid,
+        "name":  name or "",
+        "added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    return items, True
+
+
+def watchlist_ids(items: list) -> set:
+    return {e.get("jobid", "") for e in items if e.get("jobid")}
 
 
 # ──────────────────────────────────────────────
@@ -3400,10 +3596,10 @@ class ActionBar(Static):
             yield Button("U - Release",  id="btn-release")
             yield Button("X - Cancel", id="btn-scancel")
 
-    def set_selected(self, jobid: str | None) -> None:
+    def set_selected(self, jobid: str | None, pinned: bool = False) -> None:
         lbl = self.query_one("#selected-label", Label)
         if jobid:
-            lbl.update("Job: " + jobid)
+            lbl.update(("📌 " if pinned else "") + "Job: " + jobid)
         else:
             lbl.update("Job: -")
 
@@ -3560,6 +3756,7 @@ class SqueueTable(DataTable):
             self.add_column(col, width=width, key=col)
 
     _last_jobs: list[dict] = []
+    pinned: set = set()          # job ids on the watchlist, set by the app
 
     def _rebuild_columns(self) -> None:
         """Rebuild columns after a resize, then redraw the cached rows."""
@@ -3572,22 +3769,26 @@ class SqueueTable(DataTable):
 
     def refresh_jobs(self, jobs: list[dict]) -> None:
         self._last_jobs = jobs
-        selected_jobid = None
-        if self.row_count > 0:
-            try: selected_jobid = str(self.get_cell_at((self.cursor_row, 0))).strip()
-            except: pass
+        selected_jobid = cell_by_col(self, "JOBID")
         self.clear()
         new_cursor = None
+        pins = self.pinned
         for idx, j in enumerate(jobs):
             rs = "bold yellow" if j["user"] == MY_USER else "white"
             st = j["state"]
             def c(val, extra=""): return Text(val, style=f"{rs} {extra}".strip())
             est = j.get("est_start", "")
+            is_pinned = j["jobid"] in pins
+            # The marker goes on NAME, never on JOBID: the job id cell is
+            # parsed back out for every action, so it must stay verbatim.
+            name_cell = ("★ " + j["name"]) if is_pinned else j["name"]
             col_keys = [col for col, _ in self.COLS]
             def cv(key):
                 vals = {
-                    "JOBID": c(j["jobid"]), "PARTITION": c(j["partition"]),
-                    "NAME": c(j["name"]),   "USER": c(j["user"]),
+                    "JOBID": Text(j["jobid"], style="bold magenta") if is_pinned
+                             else c(j["jobid"]),
+                    "PARTITION": c(j["partition"]),
+                    "NAME": c(name_cell),   "USER": c(j["user"]),
                     "STATE": Text(st, style=state_style(st)),
                     "TIME": c(j["time"]),   "TIME LEFT": c(j["time_left"]),
                     "EST. START": Text(est or "—", style="cyan" if est else "dim"),
@@ -3649,6 +3850,7 @@ class MyJobsTable(DataTable):
             self.add_column(col, width=width, key=col)
 
     _last_jobs: list[dict] = []
+    pinned: set = set()          # job ids on the watchlist, set by the app
 
     def _rebuild_columns(self) -> None:
         self.clear(columns=True)
@@ -3658,10 +3860,7 @@ class MyJobsTable(DataTable):
 
     def refresh_jobs(self, jobs: list[dict]) -> None:
         self._last_jobs = jobs
-        selected_jobid = None
-        if self.row_count > 0:
-            try: selected_jobid = str(self.get_cell_at((self.cursor_row, 0))).strip()
-            except: pass
+        selected_jobid = cell_by_col(self, "JOBID")
         self.clear()
         mine = [j for j in jobs if j.get("user") == MY_USER]
         if not mine:
@@ -3675,11 +3874,14 @@ class MyJobsTable(DataTable):
         for idx, j in enumerate(mine):
             st = j["state"]
             est = j.get("est_start", "")
+            is_pinned = j["jobid"] in self.pinned
+            name_cell = ("★ " + j["name"]) if is_pinned else j["name"]
             col_keys = [col for col, _ in self.COLS]
             def mv(key):
                 vals = {
-                    "JOBID": Text(j["jobid"],     style="bold yellow"),
-                    "NAME":  Text(j["name"],      style="bold yellow"),
+                    "JOBID": Text(j["jobid"],
+                                  style="bold magenta" if is_pinned else "bold yellow"),
+                    "NAME":  Text(name_cell,      style="bold yellow"),
                     "STATE": Text(st,             style=state_style(st)),
                     "TIME":  Text(j["time"],      style="yellow"),
                     "TIME LEFT": Text(j["time_left"], style="yellow"),
@@ -3764,6 +3966,157 @@ class SinfoTable(DataTable):
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[sv(k) for k in col_keys])
+
+
+class ReservationTable(DataTable):
+    """Panel: cluster reservations, and whether you can use them."""
+    COLS_FULL = [
+        ("", 3), ("NAME", 18), ("STATE", 22), ("NODES", 18), ("COUNT", 7),
+        ("PARTITION", 12), ("START", 17), ("END", 17), ("USERS/ACCOUNTS", 22),
+        ("FLAGS", 20),
+    ]
+    COLS_COMPACT = [
+        ("", 3), ("NAME", 16), ("STATE", 20), ("NODES", 16),
+        ("PARTITION", 11), ("USERS/ACCOUNTS", 20),
+    ]
+    COLS_MINIMAL = [("", 3), ("NAME", 16), ("STATE", 20), ("NODES", 14)]
+
+    COLS = COLS_FULL
+    _last_rows: list = []
+
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
+
+    def on_mount(self) -> None:
+        self.cursor_type = "row"
+        self.COLS = self._pick_cols()
+        self._add_columns()
+
+    def _add_columns(self) -> None:
+        for idx, (col, width) in enumerate(self.COLS):
+            self.add_column(col or " ", width=width, key=f"{col}-{idx}")
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self.clear(columns=True)
+            self._add_columns()
+            self.populate(self._last_rows)
+
+    def populate(self, reservations: list) -> None:
+        """`reservations` carries a precomputed 'mine' flag and status label."""
+        self._last_rows = reservations
+        self.clear()
+        if not reservations:
+            self.add_row(*([Text("", style="dim")] * max(0, len(self.COLS) - 1)),
+                         Text("No reservations on this cluster", style="dim italic"))
+            return
+        for res in reservations:
+            label, style = res["_status"]
+            mine = res["_mine"]
+            marker = Text("✓" if mine else ("⚠" if res["_blocks"] else "·"),
+                          style="bold green" if mine
+                          else ("bold yellow" if res["_blocks"] else "dim"))
+            who = ",".join(res["users"] + res["accounts"])[:20] or "—"
+            col_keys = [col for col, _ in self.COLS]
+
+            def value(key, _r=res, _l=label, _s=style, _m=marker, _w=who):
+                vals = {
+                    "":          _m,
+                    "NAME":      Text(_r["name"][:18],
+                                      style="bold yellow" if _r["_mine"] else "white"),
+                    "STATE":     Text(_l, style=_s),
+                    "NODES":     Text(_r["nodes"][:18] or "—", style="cyan"),
+                    "COUNT":     Text(_r["node_cnt"] or "—", style="white"),
+                    "PARTITION": Text((_r["partition"] or "—").replace("(null)", "—"),
+                                      style="white"),
+                    "START":     Text(_r["start_time"][:16].replace("T", " "), style="dim"),
+                    "END":       Text(_r["end_time"][:16].replace("T", " "), style="dim"),
+                    "USERS/ACCOUNTS": Text(_w, style="white"),
+                    "FLAGS":     Text(",".join(_r["flags"])[:20] or "—", style="dim"),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[value(k) for k in col_keys])
+
+
+class WatchlistTable(DataTable):
+    """Panel: jobs the user pinned, surviving restarts and tab changes."""
+    COLS_FULL = [
+        ("JOBID", 12), ("NAME", 22), ("STATE", 12), ("TIME", 10),
+        ("TIME LEFT", 10), ("NODES", 14), ("REASON", 22), ("PINNED", 18),
+    ]
+    COLS_COMPACT = [
+        ("JOBID", 12), ("NAME", 20), ("STATE", 12), ("TIME LEFT", 10), ("REASON", 18),
+    ]
+    COLS_MINIMAL = [("JOBID", 12), ("NAME", 16), ("STATE", 12)]
+
+    COLS = COLS_FULL
+    _last_rows: list = []
+
+    def _pick_cols(self) -> list:
+        w = self.app.size.width if self.app else 200
+        if w >= 140: return self.COLS_FULL
+        if w >= 90:  return self.COLS_COMPACT
+        return self.COLS_MINIMAL
+
+    def on_mount(self) -> None:
+        self.cursor_type = "row"
+        self.COLS = self._pick_cols()
+        self._add_columns()
+
+    def _add_columns(self) -> None:
+        for col, width in self.COLS:
+            self.add_column(col, width=width, key=col)
+
+    def on_resize(self, event) -> None:
+        new_cols = self._pick_cols()
+        if new_cols != self.COLS:
+            self.COLS = new_cols
+            self.clear(columns=True)
+            self._add_columns()
+            self.populate(self._last_rows)
+
+    def populate(self, rows: list) -> None:
+        selected = cell_by_col(self, "JOBID")
+        self._last_rows = rows
+        self.clear()
+        if not rows:
+            self.add_row(
+                Text("—", style="dim"),
+                Text("Nothing pinned — press P on a job to watch it",
+                     style="dim italic"),
+                *[Text("", style="dim")] * (len(self.COLS) - 2))
+            return
+        new_cursor = None
+        for idx, row in enumerate(rows):
+            state = row.get("state", "")
+            col_keys = [col for col, _ in self.COLS]
+
+            def value(key, _r=row, _st=state):
+                vals = {
+                    "JOBID":     Text(_r["jobid"], style="bold yellow"),
+                    "NAME":      Text((_r.get("name") or "")[:22], style="white"),
+                    "STATE":     Text(_st or "…", style=state_style(_st) if _st else "dim"),
+                    "TIME":      Text(_r.get("time", ""), style="white"),
+                    "TIME LEFT": Text(_r.get("time_left", ""), style="white"),
+                    "NODES":     Text((_r.get("nodes") or "")[:14], style="white"),
+                    "REASON":    Text((_r.get("reason") or "")[:22], style="dim"),
+                    "PINNED":    Text(_r.get("added", "")[:16], style="dim"),
+                }
+                return vals.get(key, Text(""))
+            self.add_row(*[value(k) for k in col_keys])
+            if row["jobid"] == selected:
+                new_cursor = idx
+        if new_cursor is not None:
+            self.move_cursor(row=new_cursor)
+
+    def get_selected_jobid(self):
+        val = cell_by_col(self, "JOBID")
+        return val if val != "—" else None
 
 
 class EventLog(RichLog):
@@ -4061,6 +4414,25 @@ class SlurmDashboard(App):
         background: #161b22; color: #58a6ff;
         padding: 0 1; border-bottom: solid #30363d; height: 1;
     }
+    #resv-panel  { height: 1fr; layout: vertical; }
+    #watch-panel { height: 1fr; layout: vertical; }
+    #resv-toolbar, #watch-toolbar {
+        height: 3; background: #161b22; border-bottom: solid #30363d;
+        align: left middle; padding: 0 2;
+    }
+    #resv-toolbar-lbl, #watch-toolbar-lbl {
+        color: #58a6ff; text-style: bold; margin-right: 2;
+    }
+    #btn-resv-refresh, #btn-watch-unpin, #btn-watch-clear {
+        background: #21262d; color: #c9d1d9; border: none;
+        min-width: 18; margin-right: 1;
+    }
+    #btn-resv-refresh:hover { background: #1f6feb; color: white; }
+    #btn-watch-unpin:hover  { background: #9e6a03; color: white; }
+    #btn-watch-clear:hover  { background: #6e40c9; color: white; }
+    #resv-summary, #watch-summary { color: #8b949e; margin-left: 2; }
+    #resv-legend { color: #484f58; height: 1; padding: 0 2; }
+    #resv-table, #watch-table { height: 1fr; }
     #history-panel { height: 1fr; }
     #history-toolbar {
         height: 3; background: #161b22; border-bottom: solid #30363d;
@@ -4106,6 +4478,9 @@ class SlurmDashboard(App):
         ("f", "job_efficiency", "Efficiency"),
         ("w", "why_pending",    "Why pending"),
         ("k", "bulk_cancel",    "Bulk cancel"),
+        ("7", "tab_resv",       "Reservations"),
+        ("8", "tab_watch",      "Watchlist"),
+        ("p", "toggle_watch",   "Pin/Unpin"),
     ]
 
     TITLE = "SLURM Dashboard"
@@ -4120,6 +4495,11 @@ class SlurmDashboard(App):
         self._prev_states: dict[str, str] = {}
         self._history: list[dict] = []
         self._jobs_by_id: dict[str, dict] = {}
+        self._watchlist: list = []
+        self._watch_states: dict = {}      # sacct-resolved states for pinned jobs
+        self._reservations: list = []
+        self._my_accounts: list = []
+        self._reservations_loaded = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -4132,6 +4512,8 @@ class SlurmDashboard(App):
             Tab("🕑 History",   id="tab-history"),
             Tab("📊 Stats",     id="tab-stats"),
             Tab("🚀 Jobs",      id="tab-jobs"),
+            Tab("🔒 Reservations", id="tab-resv"),
+            Tab("📌 Watchlist", id="tab-watch"),
         )
         with Container(id="main-layout"):
             yield SqueueTable(id="squeue-table")
@@ -4172,6 +4554,25 @@ class SlurmDashboard(App):
                 with Vertical(id="jobs-info-panel"):
                     yield RichLog(id="jobs-info-log", highlight=False,
                                   markup=False, wrap=True, max_lines=2000)
+            # ── Reservations panel ──
+            with Vertical(id="resv-panel"):
+                with Horizontal(id="resv-toolbar"):
+                    yield Label("🔒  Cluster reservations", id="resv-toolbar-lbl")
+                    yield Button("↻  Refresh", id="btn-resv-refresh")
+                    yield Label("", id="resv-summary")
+                yield ReservationTable(id="resv-table")
+                yield Label(
+                    "  ✓ you may submit into it   ⚠ maintenance that blocks jobs"
+                    "   · other users",
+                    id="resv-legend")
+            # ── Watchlist panel ──
+            with Vertical(id="watch-panel"):
+                with Horizontal(id="watch-toolbar"):
+                    yield Label("📌  Watchlist", id="watch-toolbar-lbl")
+                    yield Button("📌  Unpin [p]", id="btn-watch-unpin")
+                    yield Button("🧹  Clear finished", id="btn-watch-clear")
+                    yield Label("", id="watch-summary")
+                yield WatchlistTable(id="watch-table")
         yield ActionBar(id="action-bar")
         yield Footer()
 
@@ -4182,8 +4583,11 @@ class SlurmDashboard(App):
         self.query_one("#history-panel").display = False
         self.query_one("#stats-panel").display   = False
         self.query_one("#jobs-panel").display    = False
+        self.query_one("#resv-panel").display    = False
+        self.query_one("#watch-panel").display   = False
         self.query_one(ActionBar).display        = True
         self._history = load_history()
+        self._watchlist = load_watchlist()
         self._worker_fix_stale_history()   # audit stale RUNNING/PENDING on startup
         self.refresh_data()
         self.set_interval(REFRESH_INTERVAL, self.refresh_data)
@@ -4199,6 +4603,8 @@ class SlurmDashboard(App):
         self.query_one("#history-panel").display = (tid == "tab-history")
         self.query_one("#stats-panel").display   = (tid == "tab-stats")
         self.query_one("#jobs-panel").display    = (tid == "tab-jobs")
+        self.query_one("#resv-panel").display    = (tid == "tab-resv")
+        self.query_one("#watch-panel").display   = (tid == "tab-watch")
         self.query_one(ActionBar).display        = tid in ("tab-all", "tab-mine")
         self._sync_action_bar()
         if tid == "tab-history":
@@ -4207,6 +4613,11 @@ class SlurmDashboard(App):
             self.refresh_stats()
         if tid == "tab-jobs":
             self._render_jobs_panel()
+        if tid == "tab-resv":
+            self.refresh_reservations()
+        if tid == "tab-watch":
+            self._refresh_watchlist_table()
+            self._resolve_watch_states()
 
     # ── history search ──
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -4229,7 +4640,9 @@ class SlurmDashboard(App):
 
     # ── action bar sync ──
     def _sync_action_bar(self) -> None:
-        self.query_one(ActionBar).set_selected(self._get_selected_jobid())
+        jobid = self._get_selected_jobid()
+        self.query_one(ActionBar).set_selected(
+            jobid, pinned=bool(jobid) and self._is_pinned(jobid))
 
     def _get_active_table(self):
         if self._active_tab == "tab-all":  return self.query_one(SqueueTable)
@@ -4239,6 +4652,8 @@ class SlurmDashboard(App):
     def _get_selected_jobid(self) -> str | None:
         if self._active_tab == "tab-history":
             return self.query_one(HistoryTable).get_selected_jobid()
+        if self._active_tab == "tab-watch":
+            return self.query_one(WatchlistTable).get_selected_jobid()
         t = self._get_active_table()
         return t.get_selected_jobid() if t else None
 
@@ -4279,6 +4694,9 @@ class SlurmDashboard(App):
             "btn-jobs-eff":       self.action_job_efficiency,
             "btn-jobs-why":       self.action_why_pending,
             "btn-jobs-bulk":      self.action_bulk_cancel,
+            "btn-resv-refresh":   self.refresh_reservations,
+            "btn-watch-unpin":    self.action_toggle_watch,
+            "btn-watch-clear":    self.action_clear_finished_watch,
         }
         handler = actions.get(bid)
         if handler is not None:
@@ -4586,6 +5004,170 @@ class SlurmDashboard(App):
             self.query_one(EventLog).log_event(f"scontrol release {jobid} → OK", "bold green")
         self.refresh_data()
 
+    # ── reservations ────────────────────────────────────────────────────
+    def refresh_reservations(self) -> None:
+        self._worker_reservations()
+
+    @work(thread=True, exclusive=True, group="reservations")
+    def _worker_reservations(self) -> None:
+        reservations = parse_reservations()
+        # Account membership rarely changes; look it up once per session.
+        accounts = self._my_accounts or get_my_accounts()
+        self.app.call_from_thread(self._apply_reservations, reservations, accounts)
+
+    def _apply_reservations(self, reservations: list, accounts: list) -> None:
+        self._my_accounts = accounts
+        for res in reservations:
+            res["_mine"] = reservation_is_mine(res, MY_USER, accounts)
+            res["_blocks"] = reservation_blocks_jobs(res)
+        # Ones you can use first, then blocking maintenance, then the rest.
+        reservations.sort(key=lambda r: (not r["_mine"], not r["_blocks"], r["name"]))
+        self._reservations = reservations
+        self._reservations_loaded = True
+        self._rerender_reservations()
+
+    def _rerender_reservations(self) -> None:
+        """Recompute the time labels from cached data.
+
+        Called on every poll while the tab is open so the "starts in 3h"
+        countdowns stay honest, without asking the controller again.
+        """
+        reservations = self._reservations
+        now = datetime.now()
+        for res in reservations:
+            res["_status"] = reservation_status(res, now)
+        try:
+            self.query_one(ReservationTable).populate(reservations)
+            mine = sum(1 for r in reservations if r["_mine"])
+            blocking = sum(1 for r in reservations if r["_blocks"])
+            summary = (f"{len(reservations)} total  ·  {mine} available to you"
+                       f"  ·  {blocking} blocking maintenance")
+            self.query_one("#resv-summary", Label).update(summary)
+        except Exception:
+            pass
+
+    # ── watchlist ───────────────────────────────────────────────────────
+    def _is_pinned(self, jobid: str) -> bool:
+        return jobid in watchlist_ids(self._watchlist)
+
+    def action_toggle_watch(self) -> None:
+        jobid = self._get_selected_jobid()
+        if not jobid:
+            self.notify("Select a job first", severity="warning", timeout=3)
+            return
+        if not is_valid_jobid(jobid):
+            self.notify(f"Invalid job id: {jobid!r}", severity="error")
+            return
+        job = self._jobs_by_id.get(jobid, {})
+        entry = next((e for e in self._history if e.get("jobid") == jobid), {})
+        name = job.get("name") or entry.get("name", "")
+        self._watchlist, pinned = toggle_watch(self._watchlist, jobid, name)
+        if not save_watchlist(self._watchlist):
+            self.notify(f"Could not write {WATCHLIST_FILE}", severity="error")
+        self.notify(f"Job {jobid} {'pinned to' if pinned else 'removed from'} "
+                    f"the watchlist", timeout=3)
+        self.query_one(EventLog).log_event(
+            f"{'pin' if pinned else 'unpin'} {jobid}",
+            "bold magenta" if pinned else "dim")
+        self._sync_action_bar()
+        self._refresh_watchlist_table()
+        # Repaint the queue tables so the pin marker updates immediately.
+        self._apply_pins_to_tables()
+        if pinned:
+            self._resolve_watch_states()
+
+    def action_clear_finished_watch(self) -> None:
+        """Drop pinned jobs that have reached a final state."""
+        live = self._jobs_by_id
+        keep, dropped = [], 0
+        for entry in self._watchlist:
+            jid = entry["jobid"]
+            if jid in live:
+                keep.append(entry)
+                continue
+            state = self._watch_state_for(jid)
+            if state and state.upper() in TERMINAL_STATES:
+                dropped += 1
+            else:
+                keep.append(entry)
+        if not dropped:
+            self.notify("No finished jobs pinned", severity="warning", timeout=3)
+            return
+        self._watchlist = keep
+        save_watchlist(self._watchlist)
+        self.notify(f"Removed {dropped} finished job(s) from the watchlist",
+                    timeout=4)
+        self._refresh_watchlist_table()
+        self._apply_pins_to_tables()
+
+    def _watch_state_for(self, jobid: str) -> str:
+        job = self._jobs_by_id.get(jobid)
+        if job:
+            return job.get("state", "")
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
+        if entry and entry.get("state"):
+            return entry["state"]
+        return self._watch_states.get(jobid, "")
+
+    def _watchlist_rows(self) -> list:
+        rows = []
+        for entry in self._watchlist:
+            jid = entry["jobid"]
+            live = self._jobs_by_id.get(jid)
+            hist = next((e for e in self._history if e.get("jobid") == jid), {})
+            rows.append({
+                "jobid":     jid,
+                "name":      (live or {}).get("name") or entry.get("name")
+                             or hist.get("name", ""),
+                "state":     self._watch_state_for(jid),
+                "time":      (live or {}).get("time", ""),
+                "time_left": (live or {}).get("time_left", ""),
+                "nodes":     (live or {}).get("nodes", ""),
+                "reason":    (live or {}).get("reason", ""),
+                "added":     entry.get("added", ""),
+            })
+        return rows
+
+    def _refresh_watchlist_table(self) -> None:
+        try:
+            rows = self._watchlist_rows()
+            self.query_one(WatchlistTable).populate(rows)
+            running = sum(1 for r in rows if r["state"] in ("R", "RUNNING"))
+            pending = sum(1 for r in rows if r["state"] in ("PD", "PENDING"))
+            done = sum(1 for r in rows
+                       if (r["state"] or "").upper() in TERMINAL_STATES)
+            self.query_one("#watch-summary", Label).update(
+                f"{len(rows)} pinned  ·  {running} running  ·  {pending} pending"
+                f"  ·  {done} finished")
+        except Exception:
+            pass
+
+    @work(thread=True, exclusive=True, group="watchstates")
+    def _resolve_watch_states(self) -> None:
+        """Ask sacct about pinned jobs we have no state for."""
+        unknown = [e["jobid"] for e in self._watchlist
+                   if not self._watch_state_for(e["jobid"])]
+        if not unknown:
+            return
+        states = sacct_final_state(unknown)
+        if states:
+            self.app.call_from_thread(self._apply_watch_states, states)
+
+    def _apply_watch_states(self, states: dict) -> None:
+        self._watch_states.update(states)
+        self._refresh_watchlist_table()
+
+    def _apply_pins_to_tables(self) -> None:
+        """Hand the pinned set to the queue tables and repaint them."""
+        pinned = watchlist_ids(self._watchlist)
+        for table_cls in (SqueueTable, MyJobsTable):
+            try:
+                table = self.query_one(table_cls)
+                table.pinned = pinned
+                table.refresh_jobs(table._last_jobs)
+            except Exception:
+                pass
+
     # ── data refresh ──
     @work(thread=True)
     def _worker_fix_stale_history(self) -> None:
@@ -4683,6 +5265,9 @@ class SlurmDashboard(App):
 
     def _apply_update(self, jobs, nodes, stats, ts, events) -> None:
         self._jobs_by_id = {j["jobid"]: j for j in jobs}
+        pins = watchlist_ids(self._watchlist)
+        self.query_one(SqueueTable).pinned = pins
+        self.query_one(MyJobsTable).pinned = pins
         self.query_one(StatsBar).update_stats(stats, ts)
         self.query_one(SqueueTable).refresh_jobs(jobs)
         self.query_one(MyJobsTable).refresh_jobs(jobs)
@@ -4722,6 +5307,10 @@ class SlurmDashboard(App):
         # once sacct returns the real final states.
         tracked_gone = [jid for jid in gone_jids
                         if any(e.get("jobid") == jid for e in self._history)]
+        if self._active_tab == "tab-watch":
+            self._refresh_watchlist_table()
+        if self._active_tab == "tab-resv" and self._reservations_loaded:
+            self._rerender_reservations()
         if self._active_tab == "tab-history" and not tracked_gone:
             self._refresh_history_table()
 
@@ -4846,6 +5435,8 @@ class SlurmDashboard(App):
 
     def action_tab_jobs(self)  -> None: self.query_one(Tabs).active = "tab-jobs"
     def action_tab_stats(self) -> None: self.query_one(Tabs).active = "tab-stats"
+    def action_tab_resv(self)  -> None: self.query_one(Tabs).active = "tab-resv"
+    def action_tab_watch(self) -> None: self.query_one(Tabs).active = "tab-watch"
 
     def action_new_job(self) -> None:
         self.push_screen(SubmitJobModal(), self._on_job_submitted)
@@ -4974,6 +5565,9 @@ class SlurmDashboard(App):
             ("F", "Efficiency — what the job reserved versus what it used"),
             ("W", "Why pending — blocking reason, queue position, priority"),
             ("K", "Bulk cancel — cancel many of your jobs behind a typed confirm"),
+            ("P", "Pin/unpin — keep a job on the Watchlist tab across restarts"),
+            ("7", "Reservations — who has the cluster booked, and what you may use"),
+            ("8", "Watchlist — the jobs you pinned, with live state"),
             ("/", "Inside the log viewer: filter lines (text or /regex/)"),
         ]
         for key, desc in shortcuts:
@@ -4989,6 +5583,8 @@ class SlurmDashboard(App):
             "3. A job stuck in PENDING?  →  W tells you what is blocking it",
             "4. After a job finishes  →  F shows whether the request was oversized",
             "5. Stats tab  →  ⚡ Efficiency report aggregates that across your history",
+            "6. Pin the jobs you care about with P; they stay on tab 8 after a restart",
+            "7. Job will not start?  →  tab 7 shows reservations holding the nodes",
         ]
         for tip in tips:
             log.write(Text(f"  {tip}", style="#8b949e"))
@@ -4996,6 +5592,7 @@ class SlurmDashboard(App):
         log.write(Text("── Configuration " + "─" * 50, style="bold #30363d"))
         log.write(Text(f"  {CONFIG_FILE}", style="#8b949e"))
         log.write(Text(f"  templates: {TEMPLATE_FILE}", style="#8b949e"))
+        log.write(Text(f"  watchlist: {WATCHLIST_FILE}", style="#8b949e"))
         log.write(Text(f"  ssh to compute nodes: "
                        f"{'enabled' if CONFIG['monitor']['use_ssh'] else 'disabled'}",
                        style="#8b949e"))

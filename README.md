@@ -22,6 +22,8 @@ Running `squeue`, `sacct`, and `tail -f` repeatedly can get tedious. This dashbo
 - **Bulk Cancel:** Cancel many of your jobs at once behind a typed confirmation.
 - **Completion Alerts:** Terminal bell, toast, and an optional hook script when one of your jobs finishes.
 - **Works Without SSH:** Node metrics come from `scontrol`; SSH to compute nodes is optional and can be turned off entirely.
+- **Reservations:** See who has the cluster booked, which reservations *you* may submit into, and which maintenance windows are blocking your jobs.
+- **Watchlist:** Pin the jobs you care about. They stay on their own tab across restarts, with live state, and are marked with a ★ in the queue.
 
 ## Requirements
 
@@ -61,7 +63,7 @@ The UI is heavily keyboard-driven. Most panels have a footer indicating availabl
 
 | Key | Action |
 | :--- | :--- |
-| `1`-`6` | Switch between main tabs (All Jobs, My Jobs, Nodes, History, Stats) |
+| `1`-`8` | Switch between main tabs (All Jobs, My Jobs, Nodes, History, Stats, Jobs, Reservations, Watchlist) |
 | `n` | Submit a new job (opens sbatch form) |
 | `l` | View logs for the selected job |
 | `m` | Open node monitor (CPU/Mem usage) |
@@ -74,6 +76,7 @@ The UI is heavily keyboard-driven. Most panels have a footer indicating availabl
 | `f` | Efficiency report for the selected job |
 | `w` | Why is this job pending? |
 | `k` | Bulk cancel your jobs |
+| `p` | Pin / unpin the selected job (Watchlist) |
 | `Esc` / `q` | Close current modal / Quit application |
 
 Inside the log viewer: `/` focuses the filter box (plain text, or `/regex/`),
@@ -99,6 +102,7 @@ The dashboard runs entirely in user-space. It acts as a wrapper around standard 
 | `~/.slurm_dashboard_events.log` | Rolling event log of observed job state changes |
 | `~/.config/slurm_dashboard/config.ini` | Settings (see below) |
 | `~/.config/slurm_dashboard/templates.json` | Saved sbatch templates |
+| `~/.config/slurm_dashboard/watchlist.json` | Pinned jobs |
 
 ## Configuration
 
