@@ -83,7 +83,8 @@ class TestStatus:
     def test_active_window_shows_remaining(self, sd, reservations):
         label, style = sd.reservation_status(reservations[1], NOW)
         assert label == "active, 5h left"
-        assert "green" in style
+        # Palette token, not a named colour — see tests/test_theme.py
+        assert sd.PALETTE["ok"] in style
 
     def test_future_window_shows_countdown(self, sd, reservations):
         assert sd.reservation_status(reservations[0], NOW)[0] == "starts in 20h"

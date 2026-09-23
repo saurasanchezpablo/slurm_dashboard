@@ -28,6 +28,8 @@ Running `squeue`, `sacct`, and `tail -f` repeatedly can get tedious. This dashbo
 - **Works Without SSH:** Node metrics come from `scontrol`; SSH to compute nodes is optional and can be turned off entirely.
 - **Reservations:** See who has the cluster booked, which reservations *you* may submit into, and which maintenance windows are blocking your jobs.
 - **Watchlist:** Pin the jobs you care about. They stay on their own tab across restarts, with live state, and are marked with a ★ in the queue.
+- **History From Day One:** On first run the dashboard imports your recent jobs from `sacct`, so History, Stats and the efficiency reports are useful immediately instead of after weeks of watching.
+- **Node Co-Tenants:** The monitor shows which other jobs share your node — usually the reason a job runs slower than it should.
 
 ## Requirements
 
@@ -134,6 +136,12 @@ undefined or unused, or if a double-width glyph creeps in.
 To restyle the dashboard, edit `PALETTE` — every surface, border and state
 colour follows from it.
 
+The theme tests also check contrast: text tokens must clear 4.5:1 against
+every surface, state colours 3:1, and structural tokens (borders, surfaces)
+are rejected outright if used to draw text. That last rule exists because
+section headings were once styled with the hairline colour at 1.32:1, which
+made them invisible.
+
 ## Configuration
 
 The config file is created on first run. Write it explicitly with:
@@ -148,6 +156,7 @@ sqdash --show-config      # print the effective settings
 refresh_interval = 3      # seconds between squeue polls
 max_history = 500
 history_only_mine = true
+seed_history_days = 30    # import your last N days from sacct at startup (0 = off)
 
 [monitor]
 use_ssh = true            # false = read node usage from scontrol only

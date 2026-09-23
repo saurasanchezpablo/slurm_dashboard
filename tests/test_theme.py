@@ -11,6 +11,24 @@ import pytest
 
 CSS_BLOCK = re.compile(r'(?:DEFAULT_)?CSS\s*=\s*"""(.*?)"""', re.S)
 HEX = re.compile(r"#[0-9a-fA-F]{6}")
+# A whole string that is nothing but a Rich style built from a named colour.
+NAMED_STYLE = re.compile(
+    r"(?:(?:bold|dim|italic|underline|reverse|blink|strike)\s+)*"
+    r"(?:red|green|yellow|blue|cyan|magenta|white|black|dim)"
+    r"(?:\s+on\s+\w+)?", re.IGNORECASE)
+
+
+def _relative_luminance(hex_colour: str) -> float:
+    channels = [int(hex_colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    linear = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+              for c in channels]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def contrast_ratio(fg: str, bg: str) -> float:
+    a, b = _relative_luminance(fg), _relative_luminance(bg)
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
 
 
 @pytest.fixture(scope="module")
@@ -45,11 +63,40 @@ class TestPalette:
         used = {h.lower() for h in HEX.findall(after_palette)}
         assert used <= allowed, f"not palette colours: {sorted(used - allowed)}"
 
-    def test_no_named_rich_colours(self, after_palette):
-        """Named colours render differently per terminal palette."""
-        named = re.findall(r'style="(?:bold )?(?:red|green|yellow|blue|cyan|'
-                           r'magenta|white|black|dim)"', after_palette)
-        assert not named, named
+    def test_no_named_rich_colours(self, src_path):
+        """Named colours render differently per terminal palette.
+
+        Walks the AST rather than grepping for `style="..."`: the first
+        version of this test only matched that one spelling and missed 31
+        literals hiding in return values, dict values, default arguments and
+        conditional expressions.
+        """
+        import ast
+        tree = ast.parse(src_path.read_text(encoding="utf-8"))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                continue
+            if NAMED_STYLE.fullmatch(node.value.strip()):
+                offenders.append(f"line {node.lineno}: {node.value!r}")
+        assert not offenders, (
+            "named colour used as a style; use a palette constant:\n  "
+            + "\n  ".join(offenders))
+
+    def test_structural_tokens_are_never_text(self, after_palette):
+        """Surface and border tokens must not be used to draw text.
+
+        Regression: section headings were styled `bold {C.LINE}`, which is
+        the hairline colour — 1.32:1 against the panel, i.e. invisible.
+        """
+        offenders = []
+        for token in ("LINE", "LINE_STRONG", "ELEVATED", "SURFACE",
+                      "SURFACE_ALT", "PANEL", "BG"):
+            for pattern in (f'bold {{C.{token}}}', f'style=C.{token})',
+                            f'"{{C.{token}}}"'):
+                if pattern in after_palette:
+                    offenders.append(pattern)
+        assert not offenders, f"structural token used as text colour: {offenders}"
 
     def test_no_named_markup_tags(self, after_palette):
         tags = re.findall(r'\[(?:bold )?(?:red|green|yellow|blue|cyan|magenta|'
@@ -129,3 +176,36 @@ class TestGlyphs:
             and unicodedata.east_asian_width(ch) in ("W", "F")
         })
         assert not wide, f"double-width glyphs: {[(c, hex(ord(c))) for c in wide]}"
+
+
+class TestContrast:
+    """Colours that carry text must actually be readable on our surfaces."""
+
+    SURFACES = ("bg", "surface", "surface_alt", "panel")
+    # WCAG AA is 4.5:1 for body text and 3:1 for large or secondary text.
+    TEXT_TOKENS = {"fg": 4.5, "fg_muted": 4.5, "fg_faint": 3.0}
+    STATE_TOKENS = {"ok": 3.0, "info": 3.0, "warn": 3.0, "err": 3.0,
+                    "violet": 3.0, "amber": 3.0, "primary": 3.0,
+                    "primary_soft": 3.0}
+
+    @pytest.mark.parametrize("token,minimum", sorted(TEXT_TOKENS.items()))
+    def test_text_tokens_are_readable(self, sd, token, minimum):
+        for surface in self.SURFACES:
+            ratio = contrast_ratio(sd.PALETTE[token], sd.PALETTE[surface])
+            assert ratio >= minimum, (
+                f"{token} on {surface} is {ratio:.2f}:1, needs {minimum}:1")
+
+    @pytest.mark.parametrize("token,minimum", sorted(STATE_TOKENS.items()))
+    def test_state_tokens_are_readable(self, sd, token, minimum):
+        for surface in self.SURFACES:
+            ratio = contrast_ratio(sd.PALETTE[token], sd.PALETTE[surface])
+            assert ratio >= minimum, (
+                f"{token} on {surface} is {ratio:.2f}:1, needs {minimum}:1")
+
+    def test_structural_tokens_are_too_low_contrast_for_text(self, sd):
+        """Documents why they are banned as text colours above."""
+        for token in ("line", "elevated"):
+            ratio = contrast_ratio(sd.PALETTE[token], sd.PALETTE["surface"])
+            assert ratio < 3.0, (
+                f"{token} now has {ratio:.2f}:1 — if it became readable, "
+                "revisit test_structural_tokens_are_never_text")

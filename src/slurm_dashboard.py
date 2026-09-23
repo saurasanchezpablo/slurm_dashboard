@@ -168,6 +168,7 @@ CONFIG_DEFAULTS: dict[str, dict] = {
         "log_tail_lines":    200,    # lines shown in the log viewer
         "max_history":       500,    # entries kept in the history file
         "history_only_mine": True,   # only persist jobs owned by $USER
+        "seed_history_days": 30,     # import this many days from sacct at startup (0 = off)
     },
     "monitor": {
         "use_ssh":          True,    # allow SSH to compute nodes for live metrics
@@ -238,6 +239,7 @@ def load_config(path: Path | None = None) -> dict:
     cfg["general"]["refresh_interval"] = max(1, cfg["general"]["refresh_interval"])
     cfg["general"]["log_tail_lines"]   = max(10, cfg["general"]["log_tail_lines"])
     cfg["general"]["max_history"]      = max(10, cfg["general"]["max_history"])
+    cfg["general"]["seed_history_days"] = max(0, min(365, cfg["general"]["seed_history_days"]))
     cfg["monitor"]["refresh_interval"] = max(2, cfg["monitor"]["refresh_interval"])
     cfg["monitor"]["ssh_timeout"]      = max(1, cfg["monitor"]["ssh_timeout"])
     cfg["monitor"]["max_nodes"]        = max(1, cfg["monitor"]["max_nodes"])
@@ -260,6 +262,9 @@ max_history = 500
 # false also records other users' jobs; they will evict your own
 # once max_history is reached
 history_only_mine = true
+# on startup, import your jobs from the last N days via sacct so the
+# History, Stats and Efficiency tabs are populated on first run (0 = off)
+seed_history_days = 30
 
 [monitor]
 # false = read node usage from `scontrol show node` only, never SSH.
@@ -298,6 +303,7 @@ REFRESH_INTERVAL  = CONFIG["general"]["refresh_interval"]
 LOG_TAIL_LINES    = CONFIG["general"]["log_tail_lines"]
 MAX_HISTORY       = CONFIG["general"]["max_history"]
 HISTORY_ONLY_MINE = CONFIG["general"]["history_only_mine"]
+SEED_HISTORY_DAYS = CONFIG["general"]["seed_history_days"]
 
 # Job ids and node names are interpolated into the argv of external commands
 # (scancel, scontrol, ssh...).  They come from parsed command output, so they
@@ -1374,6 +1380,86 @@ def get_dependency_tree(jobid: str, depth: int = 0, visited: set = None) -> list
     return result
 
 # ──────────────────────────────────────────────
+#  HISTORY SEEDING FROM SACCT
+# ──────────────────────────────────────────────
+def sacct_recent_jobs(days: int = 30, user: str = "") -> list:
+    """Your finished jobs from the last `days`, shaped like history records.
+
+    History otherwise only accumulates while the dashboard is running, so a
+    fresh install showed an empty History tab — and empty Stats and
+    Efficiency reports built on it — until it had watched jobs come and go
+    for weeks.  One sacct query at startup fills all three immediately.
+    """
+    user = user or MY_USER
+    if days <= 0 or not user or not _NODENAME_RE.match(user):
+        return []
+    # -X: allocations only, no .batch/.extern step rows.
+    # JobName last: it is user-supplied and may contain the separator.
+    out = run_out([
+        "sacct", "-X", "-n", "-P", "-u", user, "-S", f"now-{int(days)}days",
+        "--format=JobID,State,Partition,AllocCPUS,ReqMem,AllocTRES,Start,End,Submit,JobName",
+    ])
+    jobs = []
+    for line in out.splitlines():
+        parts = line.split("|", 9)
+        if len(parts) < 10:
+            continue
+        jobid, state, partition, cpus, reqmem, tres, start, end, submit, name = (
+            p.strip() for p in parts)
+        if not jobid or not is_valid_jobid(jobid):
+            continue
+        state = state.split()[0].upper() if state else "UNKNOWN"
+
+        def stamp(*candidates):
+            for value in candidates:
+                dt = parse_slurm_datetime(value)
+                if dt:
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return ""
+
+        first_seen = stamp(start, submit)
+        last_seen = stamp(end, start, submit)
+        if not first_seen:
+            continue
+        gpus = tres_gpu_count(tres)
+        jobs.append({
+            "jobid":      jobid,
+            "name":       name[:20],
+            "user":       user,
+            "partition":  partition,
+            "cpus":       cpus,
+            "mem":        reqmem,
+            "gpus":       str(gpus) if gpus else "",
+            "state":      state,
+            "first_seen": first_seen,
+            "last_seen":  last_seen or first_seen,
+            "stdout":     "",
+            "stderr":     "",
+        })
+    return jobs
+
+
+def merge_seeded_history(history: list, seeded: list, limit: int = None) -> tuple:
+    """Add imported jobs that history does not already know about.
+
+    Existing records win: they may carry resolved stdout/stderr paths and a
+    cached submit line that sacct cannot provide.  Returns (history, added).
+    """
+    limit = MAX_HISTORY if limit is None else limit
+    known = {e.get("jobid") for e in history}
+    fresh = [j for j in seeded if j["jobid"] not in known]
+    if not fresh:
+        return history, 0
+    merged = history + fresh
+    # Oldest first, so the trim below drops the least interesting entries.
+    merged.sort(key=lambda e: e.get("first_seen", ""))
+    added = len(fresh)
+    if len(merged) > limit:
+        merged = merged[-limit:]
+    return merged, added
+
+
+# ──────────────────────────────────────────────
 #  SLURM VALUE PARSERS
 # ──────────────────────────────────────────────
 def parse_slurm_duration(t: str) -> float:
@@ -1546,14 +1632,14 @@ def efficiency_verdict(rec: dict) -> tuple[str, str]:
     """(label, style) summarising how well a job used what it reserved."""
     cpu, mem = rec.get("cpu_eff"), rec.get("mem_eff")
     if cpu is None and mem is None:
-        return "no data", "dim"
+        return "no data", C.FG_FAINT
     if (cpu is not None and cpu < 25) or (mem is not None and mem < 15):
-        return "over-allocated", "bold red"
+        return "over-allocated", f"bold {C.ERR}"
     if (cpu is not None and cpu < 60) or (mem is not None and mem < 40):
-        return "loose fit", "yellow"
+        return "loose fit", C.WARN
     if mem is not None and mem > 95:
-        return "memory-tight", "bold magenta"
-    return "good fit", "bold green"
+        return "memory-tight", f"bold {C.VIOLET}"
+    return "good fit", f"bold {C.OK}"
 
 
 def efficiency_suggestions(rec: dict) -> list[str]:
@@ -1771,6 +1857,38 @@ def get_node_info_scontrol(node: str) -> dict:
     }
 
 
+def get_node_cotenants(node: str, exclude_jobid: str = "") -> list:
+    """Other jobs running on this node.
+
+    When a job runs slower than it should, the usual explanation is another
+    job on the same node competing for memory bandwidth, cache or I/O — and
+    nothing in squeue's default view shows you who that is.
+    """
+    if not is_valid_nodename(node):
+        return []
+    # %j last: job names may contain the separator.
+    out = run_out(["squeue", "-w", node, "-h", "-o", "%i|%u|%T|%C|%m|%b|%M|%j"])
+    mine_base = str(exclude_jobid).split("_")[0].split(".")[0]
+    others = []
+    for line in out.strip().splitlines():
+        parts = line.split("|", 7)
+        if len(parts) < 8:
+            continue
+        jobid, user, state, cpus, mem, gres, elapsed, name = (p.strip() for p in parts)
+        if not jobid:
+            continue
+        if mine_base and jobid.split("_")[0].split(".")[0] == mine_base:
+            continue
+        gpu = ""
+        m = re.search(r"\d+", gres or "")
+        if m and "gpu" in (gres or "").lower():
+            gpu = m.group()
+        others.append({"jobid": jobid, "user": user, "state": state,
+                       "cpus": cpus, "mem": mem, "gpus": gpu,
+                       "elapsed": elapsed, "name": name[:24]})
+    return others
+
+
 # ──────────────────────────────────────────────
 #  TIME HELPERS
 # ──────────────────────────────────────────────
@@ -1886,7 +2004,7 @@ def reservation_status(res: dict, now=None):
         return (f"starts in {humanize_delta((start - now).total_seconds())}", C.INFO)
     if start and end and start <= now <= end:
         return (f"active, {humanize_delta((end - now).total_seconds())} left",
-                "bold green")
+                f"bold {C.OK}")
     if end and now > end:
         return ("ended", C.FG_FAINT)
     state = (res.get("state") or "").upper()
@@ -2266,7 +2384,7 @@ class SubmitJobModal(ModalScreen):
         if p["def_mem_per_cpu"]:  bits.append(f"DefMem/CPU {p['def_mem_per_cpu']}M")
         if p["max_mem_per_node"]: bits.append(f"MaxMem/Node {p['max_mem_per_node']}M")
         bits.append(f"State {p['state']}")
-        hint.update(f"  [#4d8dfb]{chosen}[/]: " + "  ·  ".join(bits))
+        hint.update(f"  [{C.PRIMARY}]{chosen}[/]: " + "  ·  ".join(bits))
 
     def _get_values(self) -> dict:
         return {f: self.query_one(f"#si-{f}", Input).value.strip()
@@ -2432,7 +2550,7 @@ class ArrayJobModal(ModalScreen):
                 Text(t["jobid"],   style=C.INFO),
                 Text(t["name"][:22]),
                 Text(st,           style=style),
-                Text(t["exitcode"],style=C.ERR if t["exitcode"] not in ("0:0","") else "dim"),
+                Text(t["exitcode"],style=C.ERR if t["exitcode"] not in ("0:0","") else C.FG_FAINT),
                 Text(t["elapsed"], style=C.FG),
                 Text(t["nodes"][:20]),
                 Text(t["start"][:16], style=C.FG_FAINT),
@@ -2633,7 +2751,7 @@ class EfficiencyModal(ModalScreen):
         verdict, vstyle = efficiency_verdict(rec)
         title.update(f"Efficiency — job [bold {C.INFO}]{self._jobid}[/] {self._job_name}")
 
-        def line(t="", s="white"):
+        def line(t="", s=C.FG):
             log.write(Text(t, style=s))
 
         def meter(label, pct, detail, invert_ok=False):
@@ -2648,7 +2766,7 @@ class EfficiencyModal(ModalScreen):
         line(f"  Wall time : {rec['elapsed_s']/3600:.2f} h over "
              f"{rec['ncpus']} CPU(s) on {rec['nnodes']} node(s)", C.FG)
         line("")
-        line("── EFFICIENCY " + "─" * 50, "bold #29313c")
+        line("── EFFICIENCY " + "─" * 50, f"bold {C.FG_MUTED}")
         meter("CPU", rec["cpu_eff"],
               f"used {rec['totalcpu_s']/3600:.2f} h of {rec['cpu_hours']:.2f} core-hours reserved")
         meter("Memory", rec["mem_eff"],
@@ -2657,14 +2775,14 @@ class EfficiencyModal(ModalScreen):
         line(f"  Verdict   : {verdict}", vstyle)
         if rec["wasted_mem_mb"] > 0 and rec["req_mem_mb"] > 0:
             line(f"  Unused RAM: {rec['wasted_mem_mb']/1024:.2f} GB reserved and never touched",
-                 "yellow" if rec["wasted_mem_mb"] > 1024 else "dim")
+                 C.WARN if rec["wasted_mem_mb"] > 1024 else C.FG_FAINT)
         line("")
-        line("── RESOURCES BILLED " + "─" * 44, "bold #29313c")
+        line("── RESOURCES BILLED " + "─" * 44, f"bold {C.FG_MUTED}")
         line(f"  CPU-hours : {rec['cpu_hours']:.2f}", C.PRIMARY_SOFT)
         if rec["gpus"]:
-            line(f"  GPU-hours : {rec['gpu_hours']:.2f}  ({rec['gpus']} GPU(s))", "bold #dd8a4c")
+            line(f"  GPU-hours : {rec['gpu_hours']:.2f}  ({rec['gpus']} GPU(s))", f"bold {C.AMBER}")
         line("")
-        line("── SUGGESTION " + "─" * 50, "bold #29313c")
+        line("── SUGGESTION " + "─" * 50, f"bold {C.FG_MUTED}")
         for tip in efficiency_suggestions(rec):
             line(f"  • {tip}", C.FG_MUTED)
 
@@ -2722,11 +2840,11 @@ class PriorityModal(ModalScreen):
         self.query_one("#prio-title", Label).update(
             f"Why is job [bold {C.INFO}]{self._jobid}[/] waiting?")
 
-        def line(t="", s="white"):
+        def line(t="", s=C.FG):
             log.write(Text(t, style=s))
 
         reason = (self._reason or "").strip()
-        line("── BLOCKING REASON " + "─" * 45, "bold #29313c")
+        line("── BLOCKING REASON " + "─" * 45, f"bold {C.FG_MUTED}")
         line(f"  Slurm reports: {reason or '(none recorded)'}", f"bold {C.WARN}")
         explanation = explain_pending_reason(reason)
         if explanation:
@@ -2736,7 +2854,7 @@ class PriorityModal(ModalScreen):
         line("")
 
         if rank and total:
-            line("── QUEUE POSITION " + "─" * 46, "bold #29313c")
+            line("── QUEUE POSITION " + "─" * 46, f"bold {C.FG_MUTED}")
             scope = f"partition {self._partition}" if self._partition else "the cluster"
             line(f"  #{rank} of {total} pending jobs in {scope}", C.FG)
             pct = int((1 - (rank - 1) / total) * 100) if total else 0
@@ -2744,7 +2862,7 @@ class PriorityModal(ModalScreen):
             line("")
 
         if prio:
-            line("── PRIORITY BREAKDOWN " + "─" * 42, "bold #29313c")
+            line("── PRIORITY BREAKDOWN " + "─" * 42, f"bold {C.FG_MUTED}")
             line(f"  Total priority: {prio['total']}", f"bold {C.FG}")
             factors = [("Age", prio["age"]), ("Fairshare", prio["fairshare"]),
                        ("Job size", prio["jobsize"]), ("Partition", prio["partition"]),
@@ -2764,7 +2882,7 @@ class PriorityModal(ModalScreen):
             line("")
 
         if share:
-            line("── YOUR FAIRSHARE " + "─" * 46, "bold #29313c")
+            line("── YOUR FAIRSHARE " + "─" * 46, f"bold {C.FG_MUTED}")
             fs = share["fairshare"]
             pct = int(max(0.0, min(1.0, fs)) * 100)
             line(f"  Fairshare factor: {fs:.4f}  [{make_bar(pct, 24)}]", bar_color(pct))
@@ -2772,7 +2890,7 @@ class PriorityModal(ModalScreen):
                  f"   Account: {share['account']}", C.FG_FAINT)
             if fs < 0.2:
                 line("  Your recent usage is high, which lowers the priority of new jobs.",
-                     "yellow")
+                     C.WARN)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-prio-close":
@@ -3241,7 +3359,7 @@ class ResourceMonitorModal(ModalScreen):
 
         def sep(title: str = "") -> None:
             if title:
-                lines.append((f"── {title} {'─'*(60-len(title))}", "bold #29313c"))
+                lines.append((f"── {title} {'─'*(60-len(title))}", f"bold {C.FG_MUTED}"))
             else:
                 lines.append(("─" * 64, C.FG_DIM))
 
@@ -3308,6 +3426,29 @@ class ResourceMonitorModal(ModalScreen):
                 else:
                     lines.append(("  (scontrol returned no data for this node)", C.FG_FAINT))
 
+                # ── who else is on this node ──
+                cotenants = get_node_cotenants(node, jobid)
+                if cotenants:
+                    mine_cpus = sum(int(c["cpus"]) for c in cotenants
+                                    if c["cpus"].isdigit())
+                    lines.append((
+                        f"  Sharing this node with {len(cotenants)} other job(s)"
+                        f" using {mine_cpus} CPU(s):", f"bold {C.WARN}"))
+                    for co in cotenants[:6]:
+                        owner = "you" if co["user"] == MY_USER else co["user"]
+                        gpu_txt = f"  {co['gpus']} GPU" if co["gpus"] else ""
+                        lines.append((
+                            f"    {co['jobid']:<12} {owner:<12} {co['state']:<10} "
+                            f"{co['cpus']:>4} CPU  {co['mem']:>7}{gpu_txt:<8} "
+                            f"{co['elapsed']:>9}  {co['name']}",
+                            C.FG if co["user"] == MY_USER else C.FG_MUTED))
+                    if len(cotenants) > 6:
+                        lines.append((f"    … and {len(cotenants) - 6} more",
+                                      C.FG_FAINT))
+                else:
+                    lines.append(("  Exclusive: no other jobs on this node",
+                                  C.FG_FAINT))
+
                 if not use_ssh:
                     continue
 
@@ -3315,7 +3456,7 @@ class ResourceMonitorModal(ModalScreen):
                 gpus = get_node_gpu_info(node)
                 if gpus:
                     lines.append(("  ── live via ssh ───────────────────────────────────", C.FG_DIM))
-                    lines.append(("  GPU  IDX  NAME                      UTIL       MEM USED / TOTAL       TEMP    POWER", "bold #4d8dfb"))
+                    lines.append(("  GPU  IDX  NAME                      UTIL       MEM USED / TOTAL       TEMP    POWER", f"bold {C.PRIMARY}"))
                     for g in gpus:
                         util_bar = make_bar(g["util"], 16)
                         util_col = bar_color(g["util"])
@@ -3914,7 +4055,7 @@ class SqueueTable(DataTable):
                     "NAME": c(name_cell),   "USER": c(j["user"]),
                     "STATE": Text(st, style=state_style(st)),
                     "TIME": c(j["time"]),   "TIME LEFT": c(j["time_left"]),
-                    "EST. START": Text(est or "—", style=C.INFO if est else "dim"),
+                    "EST. START": Text(est or "—", style=C.INFO if est else C.FG_FAINT),
                     "CPUs": c(j["cpus"]),   "MEM": c(j["mem"]),
                     "GPUs": c(j["gpus"]),   "NODES": c(j["nodes"]),
                     "REASON": c(j["reason"]),
@@ -4003,12 +4144,12 @@ class MyJobsTable(DataTable):
             def mv(key):
                 vals = {
                     "JOBID": Text(j["jobid"],
-                                  style=f"bold {C.VIOLET}" if is_pinned else "bold yellow"),
+                                  style=f"bold {C.VIOLET}" if is_pinned else f"bold {C.FG}"),
                     "NAME":  Text(name_cell,      style=f"bold {C.FG}"),
                     "STATE": Text(st,             style=state_style(st)),
                     "TIME":  Text(j["time"],      style=C.FG),
                     "TIME LEFT": Text(j["time_left"], style=C.FG),
-                    "EST. START": Text(est or "—", style=C.INFO if est else "dim"),
+                    "EST. START": Text(est or "—", style=C.INFO if est else C.FG_FAINT),
                     "CPUs":  Text(j["cpus"],      style=C.FG),
                     "MEM":   Text(j["mem"],       style=C.FG),
                     "GPUs":  Text(j["gpus"],      style=C.FG),
@@ -4060,8 +4201,9 @@ class SinfoTable(DataTable):
             self.refresh_nodes(self._last_nodes)
 
     STATE_COLORS = {
-        "idle": "green", "alloc": "bold green", "mix": "yellow",
-        "down": "bold red", "drain": "red", "drng": "red",
+        "idle": C.OK,            "alloc": f"bold {C.OK}",
+        "mix":  C.WARN,          "down":  f"bold {C.ERR}",
+        "drain": C.ERR,          "drng":  C.ERR,
     }
     def on_mount(self) -> None:
         self.COLS = self._pick_cols()
@@ -4143,7 +4285,7 @@ class ReservationTable(DataTable):
             mine = res["_mine"]
             marker = Text("✓" if mine else ("▲" if res["_blocks"] else "·"),
                           style=f"bold {C.OK}" if mine
-                          else ("bold yellow" if res["_blocks"] else "dim"))
+                          else (f"bold {C.WARN}" if res["_blocks"] else C.FG_FAINT))
             who = ",".join(res["users"] + res["accounts"])[:20] or "—"
             col_keys = [col for col, _ in self.COLS]
 
@@ -4223,7 +4365,7 @@ class WatchlistTable(DataTable):
                 vals = {
                     "JOBID":     Text(_r["jobid"], style=f"bold {C.FG}"),
                     "NAME":      Text((_r.get("name") or "")[:22], style=C.FG),
-                    "STATE":     Text(_st or "…", style=state_style(_st) if _st else "dim"),
+                    "STATE":     Text(_st or "…", style=state_style(_st) if _st else C.FG_FAINT),
                     "TIME":      Text(_r.get("time", ""), style=C.FG),
                     "TIME LEFT": Text(_r.get("time_left", ""), style=C.FG),
                     "NODES":     Text((_r.get("nodes") or "")[:14], style=C.FG),
@@ -4249,21 +4391,21 @@ class EventLog(RichLog):
         past = load_event_log(n=200)
         if past:
             self.write(Text.assemble(
-                ("─" * 22 + " previous session " + "─" * 21, "dim #6a7583")))
+                ("─" * 22 + " previous session " + "─" * 21, C.FG_FAINT)))
             for line in past:
                 if line.startswith("[") and "] " in line:
                     end = line.index("] ")
                     self.write(Text.assemble(
-                        (line[:end + 1] + " ", "dim #6a7583"),
+                        (line[:end + 1] + " ", C.FG_FAINT),
                         (line[end + 2:],        C.FG_FAINT),
                     ))
                 else:
                     self.write(Text(line, style=C.FG_FAINT))
             self.write(Text.assemble(
-                ("─" * 22 + " current session " + "─" * 23,  "dim #29313c")))
+                ("─" * 22 + " current session " + "─" * 23,  C.FG_DIM)))
         self.scroll_end(animate=False)
 
-    def log_event(self, msg: str, style: str = "white") -> None:
+    def log_event(self, msg: str, style: str = C.FG) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
         self.write(Text.assemble((f"[{ts}] ", C.FG_FAINT), (msg, style)))
         append_event_log(ts, msg)
@@ -4321,7 +4463,7 @@ class HistoryStatsPanel(Static):
         log = self.query_one("#stats-content", RichLog)
         log.clear()
 
-        def line(text: str = "", style: str = "white") -> None:
+        def line(text: str = "", style: str = C.FG) -> None:
             log.write(Text(text, style=style))
 
         def sep(title: str = "") -> None:
@@ -4349,9 +4491,9 @@ class HistoryStatsPanel(Static):
              f"  ({agg['wasted_core_hours']/agg['core_hours']*100:.0f}% of the total)"
              if agg["core_hours"] else
              f"  Core-hours wasted     : {agg['wasted_core_hours']:.1f} h",
-             "bold red" if agg["wasted_core_hours"] > agg["core_hours"] * 0.4 else "yellow")
+             f"bold {C.ERR}" if agg["wasted_core_hours"] > agg["core_hours"] * 0.4 else C.WARN)
         if agg["gpu_hours"]:
-            line(f"  GPU-hours consumed    : {agg['gpu_hours']:.1f} h", "bold #dd8a4c")
+            line(f"  GPU-hours consumed    : {agg['gpu_hours']:.1f} h", f"bold {C.AMBER}")
         line(f"  RAM reserved          : {agg['gb_hours_reserved']:.0f} GB·h", C.PRIMARY_SOFT)
         line(f"  RAM actually used     : {agg['gb_hours_used']:.0f} GB·h", C.PRIMARY_SOFT)
 
@@ -4365,7 +4507,7 @@ class HistoryStatsPanel(Static):
                  colours[bucket])
 
         sep("BIGGEST WASTE — REVIEW THESE REQUESTS")
-        line(f"  {'JOBID':<12}{'NAME':<22}{'CPU%':>6}{'MEM%':>7}{'WASTED':>10}", "bold #4d8dfb")
+        line(f"  {'JOBID':<12}{'NAME':<22}{'CPU%':>6}{'MEM%':>7}{'WASTED':>10}", f"bold {C.PRIMARY}")
         for rec in agg["worst"]:
             wasted = rec.get("cpu_hours", 0.0) * max(0.0, 1 - (rec.get("cpu_eff") or 0) / 100)
             if wasted <= 0:
@@ -4382,13 +4524,13 @@ class HistoryStatsPanel(Static):
         log = self.query_one("#stats-content", RichLog)
         log.clear()
 
-        def line(text: str = "", style: str = "white") -> None:
+        def line(text: str = "", style: str = C.FG) -> None:
             log.write(Text(text, style=style))
 
         def sep(title: str = "") -> None:
             if title:
                 bar = "─" * max(0, 62 - len(title))
-                line(f"── {title} {bar}", "bold #29313c")
+                line(f"── {title} {bar}", f"bold {C.FG_MUTED}")
             else:
                 line("─" * 66, C.FG_DIM)
 
@@ -4420,7 +4562,7 @@ class HistoryStatsPanel(Static):
 
         # ── RESOURCES USED ──
         sep("RESOURCES USED (jobs COMPLETED)")
-        line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", "bold #dd8a4c")
+        line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", f"bold {C.AMBER}")
         line(f"  CPU-hours total       : {stats['cpu_hours']:.1f} h", C.PRIMARY_SOFT)
         avg_h = int(stats["avg_wall_hrs"])
         avg_m = int((stats["avg_wall_hrs"] - avg_h) * 60)
@@ -4466,18 +4608,11 @@ class HistoryStatsPanel(Static):
 
         # ── STATE BREAKDOWN ──
         sep("STATES")
-        state_cols = {
-            "COMPLETED": "bold green", "CD": "bold green",
-            "FAILED": "bold red",      "F":  "bold red",
-            "CANCELLED": "yellow",     "CA": "yellow",
-            "TIMEOUT": "bold yellow",  "TO": "bold yellow",
-            "OUT_OF_MEMORY": "bold magenta", "OOM": "bold magenta",
-            "NODE_FAIL": "bold red",   "NF": "bold red",
-            "RUNNING": "bold cyan",    "R":  "bold cyan",
-            "PENDING": "white",        "PD": "white",
-        }
+        # state_style() is the single source for these; the panel only needs
+        # the same mapping, so reuse it rather than keeping a second copy.
+        state_cols = {}
         for state, count in sorted(stats["states"].items(), key=lambda x: -x[1]):
-            col = state_cols.get(state, C.FG_FAINT)
+            col = state_style(state)
             pct = round(count / total * 100, 1) if total else 0
             line(f"  {state:<22}  {count:>4} jobs  ({pct}%)", col)
 
@@ -4756,6 +4891,7 @@ class SlurmDashboard(App):
         self.query_one(ActionBar).display        = True
         self._history = load_history()
         self._watchlist = load_watchlist()
+        self._worker_seed_history()        # import recent jobs from sacct
         self._worker_fix_stale_history()   # audit stale RUNNING/PENDING on startup
         self.refresh_data()
         self.set_interval(REFRESH_INTERVAL, self.refresh_data)
@@ -4800,7 +4936,7 @@ class SlurmDashboard(App):
         if self._active_tab == "tab-history":
             jobid = self.query_one(HistoryTable).get_selected_jobid()
             lbl   = self.query_one("#history-selected", Label)
-            lbl.update(f"Selected: [bold {C.WARN}]{jobid}[/]" if jobid else "Selected: —")
+            lbl.update(f"Selected: [bold {C.FG}]{jobid}[/]" if jobid else "Selected: —")
 
     def _refresh_history_table(self, filter_text: str = "") -> None:
         ft = self.query_one("#history-search", Input).value if not filter_text else filter_text
@@ -5236,7 +5372,7 @@ class SlurmDashboard(App):
                     f"the watchlist", timeout=3)
         self.query_one(EventLog).log_event(
             f"{'pin' if pinned else 'unpin'} {jobid}",
-            "bold magenta" if pinned else "dim")
+            f"bold {C.VIOLET}" if pinned else C.FG_FAINT)
         self._sync_action_bar()
         self._refresh_watchlist_table()
         # Repaint the queue tables so the pin marker updates immediately.
@@ -5335,6 +5471,29 @@ class SlurmDashboard(App):
                 table.refresh_jobs(table._last_jobs)
             except Exception:
                 pass
+
+    # ── history seeding ─────────────────────────────────────────────────
+    @work(thread=True, exclusive=True, group="seed")
+    def _worker_seed_history(self) -> None:
+        """Populate history from sacct so the analytics tabs work on day one."""
+        if SEED_HISTORY_DAYS <= 0:
+            return
+        seeded = sacct_recent_jobs(SEED_HISTORY_DAYS, MY_USER)
+        if seeded:
+            self.app.call_from_thread(self._apply_seeded_history, seeded)
+
+    def _apply_seeded_history(self, seeded: list) -> None:
+        self._history, added = merge_seeded_history(self._history, seeded)
+        if not added:
+            return
+        save_history(self._history)
+        self.query_one(EventLog).log_event(
+            f"[startup] imported {added} job(s) from the last "
+            f"{SEED_HISTORY_DAYS} days via sacct", C.FG_MUTED)
+        if self._active_tab == "tab-history":
+            self._refresh_history_table()
+        if self._active_tab == "tab-stats":
+            self.refresh_stats()
 
     # ── data refresh ──
     @work(thread=True)
@@ -5764,6 +5923,9 @@ class SlurmDashboard(App):
         log.write(Text(f"  watchlist: {WATCHLIST_FILE}", style=C.FG_MUTED))
         log.write(Text(f"  ssh to compute nodes: "
                        f"{'enabled' if CONFIG['monitor']['use_ssh'] else 'disabled'}",
+                       style=C.FG_MUTED))
+        log.write(Text(f"  history seeded from sacct: "
+                       f"{str(SEED_HISTORY_DAYS) + ' days' if SEED_HISTORY_DAYS else 'off'}",
                        style=C.FG_MUTED))
 
 

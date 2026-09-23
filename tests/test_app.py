@@ -904,3 +904,115 @@ class TestReservationCountdowns:
                 assert app.query_one(sd.ReservationTable).row_count == 2
                 app.exit()
         run(scenario())
+
+
+SACCT_SEED = "\n".join([
+    "47000|COMPLETED|gpu|32|128G|cpu=32,mem=128G,gres/gpu=4|"
+    "2026-09-01T09:00:00|2026-09-01T13:00:00|2026-09-01T08:55:00|old-train",
+    "47001|FAILED|cpu|8|32G|cpu=8|"
+    "2026-09-02T10:00:00|2026-09-02T10:04:00|2026-09-02T09:58:00|old-prep",
+])
+
+
+class TestHistorySeeding:
+    def test_history_is_populated_on_first_run(self, sd, monkeypatch, tmp_path):
+        """A fresh install must not show empty History/Stats tabs."""
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": SACCT_SEED})
+        monkeypatch.setattr(sd, "SEED_HISTORY_DAYS", 30)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                ids = sorted(e["jobid"] for e in app._history)
+                # 47000/47001 imported, 101/103/104 seen live
+                assert "47000" in ids and "47001" in ids
+                app.query_one("Tabs").active = "tab-history"
+                await pilot.pause()
+                assert app.query_one(sd.HistoryTable).row_count >= 2
+                app.exit()
+        run(scenario())
+
+    def test_import_is_persisted(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": SACCT_SEED})
+        monkeypatch.setattr(sd, "SEED_HISTORY_DAYS", 30)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                saved = sd.load_history()
+                assert "47000" in {e["jobid"] for e in saved}
+                app.exit()
+        run(scenario())
+
+    def test_can_be_switched_off(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": SACCT_SEED})
+        monkeypatch.setattr(sd, "SEED_HISTORY_DAYS", 0)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "47000" not in {e["jobid"] for e in app._history}
+                app.exit()
+        run(scenario())
+
+    def test_live_records_are_not_clobbered(self, sd, monkeypatch, tmp_path):
+        """Job 101 is seen live; an import of the same id must not erase
+        the log paths the dashboard resolved for it."""
+        app = make_app(sd, monkeypatch, tmp_path, {
+            "sacct": "101|COMPLETED|gpu|4|16G|cpu=4|2026-09-01T09:00:00|"
+                     "2026-09-01T10:00:00|2026-09-01T08:00:00|seeded-name"})
+        monkeypatch.setattr(sd, "SEED_HISTORY_DAYS", 30)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                entry = next(e for e in app._history if e["jobid"] == "101")
+                entry["stdout"] = "/tmp/resolved.out"
+                app._apply_seeded_history(
+                    sd.sacct_recent_jobs(30, sd.MY_USER))
+                await pilot.pause()
+                kept = next(e for e in app._history if e["jobid"] == "101")
+                assert kept["stdout"] == "/tmp/resolved.out"
+                app.exit()
+        run(scenario())
+
+
+class TestCoTenantsInMonitor:
+    def test_monitor_lists_other_jobs_on_the_node(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+        captured = {}
+
+        def fake_cotenants(node, exclude_jobid=""):
+            captured["node"] = node
+            captured["exclude"] = exclude_jobid
+            return [{"jobid": "48222", "user": "jlopez", "state": "RUNNING",
+                     "cpus": "4", "mem": "16G", "gpus": "", "elapsed": "2:05",
+                     "name": "genome-align"}]
+        monkeypatch.setattr(sd, "get_node_cotenants", fake_cotenants)
+        monkeypatch.setattr(sd, "get_job_nodes", lambda jid: ["node07"])
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await pilot.pause()
+                modal = sd.ResourceMonitorModal("101", "train", "RUNNING")
+                app.push_screen(modal)
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert captured["node"] == "node07"
+                assert captured["exclude"] == "101"
+                app.exit()
+        run(scenario())
