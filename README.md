@@ -14,6 +14,14 @@ Running `squeue`, `sacct`, and `tail -f` repeatedly can get tedious. This dashbo
 - **Array Job Support:** Expand array jobs to inspect individual task statuses and exit codes.
 - **Dependency Trees:** Visually trace job dependencies (`afterok`, `afterany`, etc.) to understand why a job is pending.
 - **Quick Actions:** Hold, release, cancel, or resubmit jobs with a single keystroke.
+- **Efficiency Reports:** `seff`-style CPU and memory efficiency per job, plus an aggregate view over your history that shows how many core-hours you reserved and never used.
+- **Why Is My Job Pending:** Blocking reason in plain language, queue position, `sprio` priority breakdown, and your fairshare.
+- **Submit Templates:** Save an sbatch form as a named template and reload it next time. Partition limits are shown as you type.
+- **Rerun Failed Array Tasks:** Expand an array job and resubmit only the tasks that failed, as a compact `--array=1,3-5` selection.
+- **Log Search:** Filter the log viewer by text or `/regex/`, or show only error and warning lines. Live logs are tailed incrementally.
+- **Bulk Cancel:** Cancel many of your jobs at once behind a typed confirmation.
+- **Completion Alerts:** Terminal bell, toast, and an optional hook script when one of your jobs finishes.
+- **Works Without SSH:** Node metrics come from `scontrol`; SSH to compute nodes is optional and can be turned off entirely.
 
 ## Requirements
 
@@ -63,7 +71,13 @@ The UI is heavily keyboard-driven. Most panels have a footer indicating availabl
 | `c` | Cancel selected job |
 | `b` | Resubmit job |
 | `h` / `u` | Hold / Unhold job |
+| `f` | Efficiency report for the selected job |
+| `w` | Why is this job pending? |
+| `k` | Bulk cancel your jobs |
 | `Esc` / `q` | Close current modal / Quit application |
+
+Inside the log viewer: `/` focuses the filter box (plain text, or `/regex/`),
+and the **Errors only** button hides everything that is not an error or warning.
 
 Tables adapt to the terminal width: below 140 columns some columns are hidden,
 and below 90 columns only the essentials remain. Actions keep working at any
@@ -83,6 +97,61 @@ The dashboard runs entirely in user-space. It acts as a wrapper around standard 
 | :--- | :--- |
 | `~/.slurm_dashboard_history.json` | Your tracked jobs, their final states and resolved log paths |
 | `~/.slurm_dashboard_events.log` | Rolling event log of observed job state changes |
+| `~/.config/slurm_dashboard/config.ini` | Settings (see below) |
+| `~/.config/slurm_dashboard/templates.json` | Saved sbatch templates |
+
+## Configuration
+
+The config file is created on first run. Write it explicitly with:
+
+```bash
+sqdash --write-config     # create it with documented defaults
+sqdash --show-config      # print the effective settings
+```
+
+```ini
+[general]
+refresh_interval = 3      # seconds between squeue polls
+max_history = 500
+history_only_mine = true
+
+[monitor]
+use_ssh = true            # false = read node usage from scontrol only
+refresh_interval = 8
+max_nodes = 8
+
+[logs]
+live_refresh = 5
+
+[notifications]
+bell_on_finish = true
+notify_on_finish = true
+hook =                    # executable called as: hook <jobid> <state> <name>
+```
+
+**If your site does not allow SSH to compute nodes, set `use_ssh = false`.**
+The monitor then reports allocation and load from `scontrol show node`, which
+always works. With SSH enabled it additionally shows live `nvidia-smi` and
+`/proc` figures on top.
+
+The completion hook receives three arguments and runs in the background:
+
+```bash
+#!/usr/bin/env bash
+# ~/bin/job-done.sh  (chmod +x, then set hook = ~/bin/job-done.sh)
+notify-send "Slurm job $1 finished: $2 ($3)"
+```
+
+## Development
+
+```bash
+pip install pytest
+python -m pytest          # 183 tests, no Slurm installation required
+```
+
+Tests fake every Slurm command and drive the real TUI headlessly, so they run
+anywhere. `$HOME` and `$XDG_CONFIG_HOME` are redirected to a temporary
+directory, so running them never touches your own history or config.
 
 Both files are created with mode `0600`, since they record job names, working
 directories and log paths. The history file only tracks **your own** jobs

@@ -12,6 +12,7 @@ import sys
 import re
 import json
 import shutil
+import configparser
 from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
@@ -21,7 +22,7 @@ from textual.widgets import (
     Header, Footer, DataTable, Static, Label,
     RichLog, Tabs, Tab, Button, TextArea, Input
 )
-from textual.containers import Vertical, Horizontal, Container
+from textual.containers import Vertical, Horizontal, Container, VerticalScroll
 from textual.screen import ModalScreen
 from textual import work
 from textual.timer import Timer
@@ -30,15 +31,155 @@ from rich.text import Text
 # ──────────────────────────────────────────────
 #  CONFIG
 # ──────────────────────────────────────────────
-REFRESH_INTERVAL  = 3    # squeue table (lightweight, ~10ms)
-LOG_TAIL_LINES    = 200
 MY_USER           = os.environ.get("USER", "")
 HISTORY_FILE      = Path.home() / ".slurm_dashboard_history.json"
 EVENT_LOG_FILE    = Path.home() / ".slurm_dashboard_events.log"
 MAX_EVENT_LOG     = 5000   # max lines kept in the event log file
-MAX_HISTORY       = 500   # max entries to keep
-HISTORY_ONLY_MINE = True   # persist only jobs owned by MY_USER (see upsert_history)
 DEFAULT_PARTITIONS: list[str] = []
+
+CONFIG_DIR  = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "slurm_dashboard"
+CONFIG_FILE = CONFIG_DIR / "config.ini"
+TEMPLATE_FILE = CONFIG_DIR / "templates.json"
+
+# Defaults, and the schema used to coerce values read from the INI file.
+# INI is used rather than TOML because tomllib only exists on Python 3.11+
+# and this tool targets 3.9+ on login nodes we do not control.
+CONFIG_DEFAULTS: dict[str, dict] = {
+    "general": {
+        "refresh_interval":  3,      # seconds between squeue polls
+        "log_tail_lines":    200,    # lines shown in the log viewer
+        "max_history":       500,    # entries kept in the history file
+        "history_only_mine": True,   # only persist jobs owned by $USER
+    },
+    "monitor": {
+        "use_ssh":          True,    # allow SSH to compute nodes for live metrics
+        "ssh_timeout":      8,
+        "refresh_interval": 8,
+        "max_nodes":        8,       # nodes rendered per monitor refresh
+    },
+    "logs": {
+        "live_refresh": 5,           # seconds between auto-tail reads
+    },
+    "notifications": {
+        "bell_on_finish":   True,    # terminal bell when a tracked job ends
+        "notify_on_finish": True,    # toast when a tracked job ends
+        "hook":             "",      # executable run as: hook <jobid> <state> <name>
+    },
+}
+
+
+_TRUE_WORDS  = ("1", "true", "yes", "on")
+_FALSE_WORDS = ("0", "false", "no", "off")
+
+
+def _coerce(value: str, default):
+    """Coerce an INI string to the type of its default.
+
+    An unrecognised value keeps the default rather than silently becoming
+    False/0 — a typo in the config should not quietly turn a feature off.
+    """
+    # Belt and braces: the parser is configured to strip inline comments,
+    # but a value may still arrive with one attached from an older file.
+    text = str(value).split("#")[0].split(";")[0].strip()
+    if isinstance(default, bool):
+        low = text.lower()
+        if low in _TRUE_WORDS:
+            return True
+        if low in _FALSE_WORDS:
+            return False
+        return default
+    if isinstance(default, int):
+        try:
+            return int(text)
+        except ValueError:
+            return default
+    return text
+
+
+def load_config(path: Path | None = None) -> dict:
+    """Read the INI config, falling back to CONFIG_DEFAULTS for anything
+    missing or malformed.  A broken config must never stop the dashboard."""
+    cfg = {sec: dict(vals) for sec, vals in CONFIG_DEFAULTS.items()}
+    path = path or CONFIG_FILE
+    try:
+        if not path.exists():
+            return cfg
+        # inline_comment_prefixes is None by default, which would make
+        # "use_ssh = true  # explanation" parse as the whole trailing string.
+        parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+        parser.read(path, encoding="utf-8")
+        for section in parser.sections():
+            if section not in cfg:
+                continue
+            for key, raw in parser.items(section):
+                if key in cfg[section]:
+                    cfg[section][key] = _coerce(raw, CONFIG_DEFAULTS[section][key])
+    except Exception:
+        return {sec: dict(vals) for sec, vals in CONFIG_DEFAULTS.items()}
+    # Guard against values that would make the UI unusable.
+    cfg["general"]["refresh_interval"] = max(1, cfg["general"]["refresh_interval"])
+    cfg["general"]["log_tail_lines"]   = max(10, cfg["general"]["log_tail_lines"])
+    cfg["general"]["max_history"]      = max(10, cfg["general"]["max_history"])
+    cfg["monitor"]["refresh_interval"] = max(2, cfg["monitor"]["refresh_interval"])
+    cfg["monitor"]["ssh_timeout"]      = max(1, cfg["monitor"]["ssh_timeout"])
+    cfg["monitor"]["max_nodes"]        = max(1, cfg["monitor"]["max_nodes"])
+    cfg["logs"]["live_refresh"]        = max(1, cfg["logs"]["live_refresh"])
+    return cfg
+
+
+CONFIG_TEMPLATE = """\
+# Slurm Dashboard configuration.
+# Delete any setting to fall back to its default.
+# Comments must start at the beginning of a line or follow a value.
+
+[general]
+# seconds between squeue polls
+refresh_interval = 3
+# lines shown in the log viewer
+log_tail_lines = 200
+# entries kept in ~/.slurm_dashboard_history.json
+max_history = 500
+# false also records other users' jobs; they will evict your own
+# once max_history is reached
+history_only_mine = true
+
+[monitor]
+# false = read node usage from `scontrol show node` only, never SSH.
+# Set this if your site does not allow logging in to compute nodes.
+use_ssh = true
+ssh_timeout = 8
+refresh_interval = 8
+# nodes rendered per monitor refresh
+max_nodes = 8
+
+[logs]
+# seconds between auto-tail reads in the log viewer
+live_refresh = 5
+
+[notifications]
+# terminal bell when one of your jobs reaches a final state
+bell_on_finish = true
+notify_on_finish = true
+# optional executable, called as: hook <jobid> <state> <name>
+hook =
+"""
+
+
+def write_default_config(path: Path | None = None) -> Path:
+    """Create the config file with documented defaults if it is missing."""
+    path = path or CONFIG_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+    return path
+
+
+CONFIG = load_config()
+
+REFRESH_INTERVAL  = CONFIG["general"]["refresh_interval"]
+LOG_TAIL_LINES    = CONFIG["general"]["log_tail_lines"]
+MAX_HISTORY       = CONFIG["general"]["max_history"]
+HISTORY_ONLY_MINE = CONFIG["general"]["history_only_mine"]
 
 # Job ids and node names are interpolated into the argv of external commands
 # (scancel, scontrol, ssh...).  They come from parsed command output, so they
@@ -445,6 +586,41 @@ def tail_file(path: str, n: int = LOG_TAIL_LINES) -> str:
         return f"(Error reading file: {e})"
 
 
+def follow_file(path: str, offset: int = 0,
+                max_lines: int = LOG_TAIL_LINES) -> tuple[list[str], int, bool]:
+    """Incremental tail: read only what was appended since `offset`.
+
+    Returns (complete_new_lines, new_offset, reset).  `reset` means the caller
+    should discard what it had — either this is the first read or the file was
+    truncated/rotated underneath us.  A trailing partial line is deliberately
+    left unconsumed so it is returned whole on the next call.
+    """
+    if not path or not os.path.exists(path):
+        return ([], 0, False)
+    try:
+        size = os.path.getsize(path)
+        if offset > size:          # truncated or rotated
+            offset = 0
+        if offset <= 0:
+            text = tail_file(path, max_lines)
+            if text.startswith("(") and not os.path.getsize(path):
+                return ([], size, True)
+            return (text.splitlines(), size, True)
+        if size == offset:
+            return ([], offset, False)
+        with open(path, "rb") as f:
+            f.seek(offset)
+            data = f.read(size - offset)
+        cut = data.rfind(b"\n")
+        if cut == -1:
+            return ([], offset, False)      # no complete line yet
+        chunk = data[: cut + 1]
+        lines = chunk.decode("utf-8", errors="replace").splitlines()
+        return (lines, offset + len(chunk), False)
+    except Exception:
+        return ([], offset, False)
+
+
 # ──────────────────────────────────────────────
 #  RESOURCE MONITORING
 # ──────────────────────────────────────────────
@@ -464,7 +640,7 @@ def get_job_nodes(jobid: str) -> list[str]:
     # Only hand well-formed hostnames to ssh_cmd().
     return [n for n in names if is_valid_nodename(n)]
 
-def ssh_cmd(node: str, cmd: str, timeout: int = 8) -> str:
+def ssh_cmd(node: str, cmd: str, timeout: int | None = None) -> str:
     """Execute a read-only command on a compute node via SSH (key auth only).
 
     Notes:
@@ -476,8 +652,9 @@ def ssh_cmd(node: str, cmd: str, timeout: int = 8) -> str:
         a host whose key changed, which is what detects a MITM.  "no" accepted
         changed keys silently.
     """
-    if not is_valid_nodename(node):
+    if not is_valid_nodename(node) or not CONFIG["monitor"]["use_ssh"]:
         return ""
+    timeout = timeout or CONFIG["monitor"]["ssh_timeout"]
     try:
         with open(os.devnull, "r") as devnull:
             r = subprocess.run(
@@ -1073,6 +1250,588 @@ def get_dependency_tree(jobid: str, depth: int = 0, visited: set = None) -> list
     return result
 
 # ──────────────────────────────────────────────
+#  SLURM VALUE PARSERS
+# ──────────────────────────────────────────────
+def parse_slurm_duration(t: str) -> float:
+    """Seconds from a Slurm duration.
+
+    Accepts every shape sacct emits: "1-02:03:04", "02:03:04", "12:34.567"
+    (TotalCPU uses MM:SS.mmm) and bare seconds.
+    """
+    t = (t or "").strip()
+    if not t or t.upper() in ("UNLIMITED", "N/A", "INVALID", "UNKNOWN", "NONE"):
+        return 0.0
+    days = 0
+    if "-" in t:
+        d, _, t = t.partition("-")
+        try:
+            days = int(d)
+        except ValueError:
+            return 0.0
+    parts = t.split(":")
+    try:
+        nums = [float(x) for x in parts]
+    except ValueError:
+        return 0.0
+    if len(parts) == 3:
+        h, m, s = nums
+    elif len(parts) == 2:
+        h, m, s = 0.0, nums[0], nums[1]
+    elif len(parts) == 1:
+        h, m, s = 0.0, 0.0, nums[0]
+    else:
+        return 0.0
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+_MEM_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([KMGTP]?)([nc]?)$", re.IGNORECASE)
+_MEM_FACTOR = {"K": 1.0 / 1024, "M": 1.0, "G": 1024.0, "T": 1024.0 * 1024, "P": 1024.0 ** 3}
+
+
+def parse_mem(value: str) -> tuple[float, str]:
+    """(megabytes, scope) from a Slurm memory string.
+
+    scope is "c" for per-CPU, "n" for per-node (Slurm appends these to
+    ReqMem) or "" when the figure is already a total.  An absent unit means
+    megabytes, which is what Slurm assumes for ReqMem.
+    """
+    value = (value or "").strip()
+    if not value or value.upper() in ("N/A", "UNKNOWN", "0"):
+        return 0.0, ""
+    m = _MEM_RE.match(value)
+    if not m:
+        return 0.0, ""
+    number = float(m.group(1))
+    unit = (m.group(2) or "M").upper()
+    scope = (m.group(3) or "").lower()
+    return number * _MEM_FACTOR.get(unit, 1.0), scope
+
+
+def parse_tres(tres: str) -> dict[str, str]:
+    """Parse "cpu=4,mem=16G,node=1,gres/gpu=2" into a dict."""
+    out: dict[str, str] = {}
+    for item in (tres or "").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, _, val = item.partition("=")
+        out[key.strip().lower()] = val.strip()
+    return out
+
+
+def tres_gpu_count(tres: str) -> int:
+    """GPU count from an AllocTRES string, across the spellings in use."""
+    d = parse_tres(tres)
+    for key in ("gres/gpu", "gpu"):
+        if key in d:
+            m = re.search(r"\d+", d[key])
+            if m:
+                return int(m.group())
+    for key, val in d.items():
+        if key.startswith("gres/gpu:"):
+            m = re.search(r"\d+", val)
+            if m:
+                return int(m.group())
+    return 0
+
+
+# ──────────────────────────────────────────────
+#  JOB EFFICIENCY  (seff-style, from sacct)
+# ──────────────────────────────────────────────
+def get_job_efficiency(jobids: list[str]) -> dict[str, dict]:
+    """CPU and memory efficiency per job, measured rather than estimated.
+
+    Queries sacct WITHOUT -X on purpose: MaxRSS is only recorded on the step
+    rows (.batch/.0), while the allocation row carries Elapsed, NCPUS, NNodes
+    and ReqMem.  The rows are merged back together per base job id.
+    """
+    jobids = [j for j in jobids if is_valid_jobid(j)]
+    if not jobids:
+        return {}
+
+    rows: list[list[str]] = []
+    for i in range(0, len(jobids), 50):
+        out = run_out([
+            "sacct", "-j", ",".join(jobids[i:i + 50]), "-n", "-P",
+            "--format=JobID,State,Elapsed,TotalCPU,NCPUS,NNodes,ReqMem,MaxRSS,AllocTRES,ExitCode",
+        ])
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 10:
+                rows.append([p.strip() for p in parts[:10]])
+
+    jobs: dict[str, dict] = {}
+    for jid, state, elapsed, totalcpu, ncpus, nnodes, reqmem, maxrss, tres, exitcode in rows:
+        base = jid.split(".")[0]
+        is_step = "." in jid
+        rec = jobs.setdefault(base, {
+            "jobid": base, "state": "", "elapsed_s": 0.0, "totalcpu_s": 0.0,
+            "ncpus": 0, "nnodes": 0, "req_mem_mb": 0.0, "max_rss_mb": 0.0,
+            "gpus": 0, "exitcode": "", "step_cpu_s": 0.0,
+        })
+        cpu_s = parse_slurm_duration(totalcpu)
+        rss_mb, _ = parse_mem(maxrss)
+        if is_step:
+            # Steps contribute MaxRSS (peak across them) and, as a fallback,
+            # the CPU time when the allocation row does not carry it.
+            rec["max_rss_mb"] = max(rec["max_rss_mb"], rss_mb)
+            rec["step_cpu_s"] += cpu_s
+        else:
+            rec["state"] = state.split()[0].upper() if state else rec["state"]
+            rec["exitcode"] = exitcode or rec["exitcode"]
+            rec["elapsed_s"] = parse_slurm_duration(elapsed)
+            rec["totalcpu_s"] = cpu_s
+            try:
+                rec["ncpus"] = int(ncpus or 0)
+            except ValueError:
+                rec["ncpus"] = 0
+            try:
+                rec["nnodes"] = int(nnodes or 0)
+            except ValueError:
+                rec["nnodes"] = 0
+            mem_mb, scope = parse_mem(reqmem)
+            rec["req_mem_mb"] = mem_mb
+            rec["req_mem_scope"] = scope
+            rec["gpus"] = tres_gpu_count(tres)
+            rec["max_rss_mb"] = max(rec["max_rss_mb"], rss_mb)
+
+    for rec in jobs.values():
+        if not rec["totalcpu_s"]:
+            rec["totalcpu_s"] = rec["step_cpu_s"]
+        rec.pop("step_cpu_s", None)
+
+        # ReqMem may be expressed per CPU or per node; scale to a total.
+        scope = rec.pop("req_mem_scope", "")
+        if scope == "c":
+            rec["req_mem_mb"] *= max(rec["ncpus"], 1)
+        elif scope == "n":
+            rec["req_mem_mb"] *= max(rec["nnodes"], 1)
+
+        core_seconds = rec["elapsed_s"] * rec["ncpus"]
+        rec["cpu_eff"] = round(rec["totalcpu_s"] / core_seconds * 100, 1) if core_seconds > 0 else None
+        rec["mem_eff"] = round(rec["max_rss_mb"] / rec["req_mem_mb"] * 100, 1) if rec["req_mem_mb"] > 0 else None
+        rec["cpu_hours"] = round(rec["elapsed_s"] * rec["ncpus"] / 3600.0, 2)
+        rec["gpu_hours"] = round(rec["elapsed_s"] * rec["gpus"] / 3600.0, 2)
+        # Memory that was reserved and never touched — the number that
+        # matters for cluster citizenship.
+        rec["wasted_mem_mb"] = round(max(0.0, rec["req_mem_mb"] - rec["max_rss_mb"]), 1)
+    return jobs
+
+
+def efficiency_verdict(rec: dict) -> tuple[str, str]:
+    """(label, style) summarising how well a job used what it reserved."""
+    cpu, mem = rec.get("cpu_eff"), rec.get("mem_eff")
+    if cpu is None and mem is None:
+        return "no data", "dim"
+    if (cpu is not None and cpu < 25) or (mem is not None and mem < 15):
+        return "over-allocated", "bold red"
+    if (cpu is not None and cpu < 60) or (mem is not None and mem < 40):
+        return "loose fit", "yellow"
+    if mem is not None and mem > 95:
+        return "memory-tight", "bold magenta"
+    return "good fit", "bold green"
+
+
+def efficiency_suggestions(rec: dict) -> list[str]:
+    """Concrete, copy-pasteable advice derived from an efficiency record."""
+    tips: list[str] = []
+    cpu, mem = rec.get("cpu_eff"), rec.get("mem_eff")
+    ncpus = max(int(rec.get("ncpus") or 0), 1)
+
+    if mem is not None and rec.get("req_mem_mb"):
+        peak_mb = rec.get("max_rss_mb", 0.0)
+        if mem < 50 and peak_mb > 0:
+            # Round a 20% headroom up to a friendly GB figure.
+            suggest_gb = max(1, int((peak_mb * 1.2) / 1024 + 0.999))
+            tips.append(f"Request about --mem={suggest_gb}G instead of "
+                        f"{rec['req_mem_mb']/1024:.1f}G (peak was "
+                        f"{peak_mb/1024:.2f}G plus 20% headroom).")
+        elif mem > 95:
+            tips.append("Peak memory nearly hit the request — raise --mem a little "
+                        "to avoid an OUT_OF_MEMORY kill.")
+
+    if cpu is not None:
+        if cpu < 40 and ncpus > 1:
+            useful = max(1, round(ncpus * cpu / 100))
+            tips.append(f"Only ~{useful} of {ncpus} cores were busy; try "
+                        f"--cpus-per-task={useful} unless the job is I/O bound.")
+        elif cpu > 95 and ncpus > 1:
+            tips.append("CPU use was near perfect — more cores may cut wall time.")
+
+    if rec.get("state") == "TIMEOUT":
+        tips.append("The job hit its wall clock limit; raise --time or checkpoint.")
+    if rec.get("state") == "OUT_OF_MEMORY":
+        tips.append("The job was killed for exceeding its memory request; raise --mem.")
+
+    if not tips:
+        tips.append("Resource request looks well matched to actual usage.")
+    return tips
+
+
+# ──────────────────────────────────────────────
+#  WHY IS MY JOB PENDING?  (sprio / sshare)
+# ──────────────────────────────────────────────
+def get_job_priority(jobid: str) -> dict:
+    """Priority factor breakdown for a pending job, via sprio."""
+    if not is_valid_jobid(jobid):
+        return {}
+    out = run_out(["sprio", "-j", jobid, "-h", "-o", "%i|%Y|%A|%F|%J|%P|%Q|%T|%N"])
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 9 or not parts[0]:
+            continue
+        def num(v):
+            try:
+                return int(float(v))
+            except (TypeError, ValueError):
+                return 0
+        return {
+            "jobid": parts[0], "total": num(parts[1]), "age": num(parts[2]),
+            "fairshare": num(parts[3]), "jobsize": num(parts[4]),
+            "partition": num(parts[5]), "qos": num(parts[6]),
+            "tres": num(parts[7]), "nice": num(parts[8]),
+        }
+    return {}
+
+
+def get_priority_queue_position(jobid: str, partition: str = "") -> tuple[int, int]:
+    """(rank, total) of a pending job among pending jobs in its partition."""
+    if not is_valid_jobid(jobid):
+        return (0, 0)
+    cmd = ["squeue", "-h", "-t", "PENDING", "-o", "%i|%Q", "--sort=-p"]
+    if partition and _NODENAME_RE.match(partition):
+        cmd += ["-p", partition]
+    out = run_out(cmd)
+    ids = [ln.split("|")[0].strip() for ln in out.strip().splitlines() if ln.strip()]
+    try:
+        return (ids.index(jobid) + 1, len(ids))
+    except ValueError:
+        return (0, len(ids))
+
+
+def get_fairshare() -> dict:
+    """The current user's fairshare figures, via sshare."""
+    out = run_out(["sshare", "-U", "-n", "-P", "-o",
+                   "Account,User,RawUsage,EffectvUsage,FairShare"])
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 5 or not parts[1]:
+            continue
+        def f(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+        return {"account": parts[0], "user": parts[1], "raw_usage": f(parts[2]),
+                "effective_usage": f(parts[3]), "fairshare": f(parts[4])}
+    return {}
+
+
+PENDING_REASON_HELP = {
+    "Resources":        "The cluster is busy; your job is waiting for nodes to free up.",
+    "Priority":         "Jobs with a higher priority are queued ahead of yours.",
+    "Dependency":       "A job you depend on has not finished yet (press E for the tree).",
+    "DependencyNeverSatisfied": "A dependency failed — this job will never start. Cancel it.",
+    "QOSMaxJobsPerUserLimit":   "You already run the maximum jobs allowed by this QOS.",
+    "QOSMaxCpuPerUserLimit":    "You already hold the maximum CPUs allowed by this QOS.",
+    "AssocMaxJobsLimit":        "Your account has reached its concurrent job limit.",
+    "AssocGrpCpuLimit":         "Your account has reached its CPU limit.",
+    "AssocGrpGRES":             "Your account has reached its GPU limit.",
+    "PartitionTimeLimit":       "The requested wall time exceeds the partition limit.",
+    "PartitionNodeLimit":       "The requested node count exceeds the partition limit.",
+    "ReqNodeNotAvail":          "A requested node is down, drained or reserved.",
+    "JobHeldUser":              "You put this job on hold — press U to release it.",
+    "JobHeldAdmin":             "An administrator put this job on hold.",
+    "BeginTime":                "The job has a --begin time that has not arrived yet.",
+    "Licenses":                 "Waiting for a software license to be released.",
+    "ReqNodeNotAvail,":         "A requested node is unavailable.",
+    "None":                     "Slurm has not recorded a blocking reason yet.",
+}
+
+
+def explain_pending_reason(reason: str) -> str:
+    reason = (reason or "").strip().strip("()")
+    if not reason:
+        return ""
+    if reason in PENDING_REASON_HELP:
+        return PENDING_REASON_HELP[reason]
+    for key, text in PENDING_REASON_HELP.items():
+        if reason.startswith(key):
+            return text
+    return ""
+
+
+# ──────────────────────────────────────────────
+#  PARTITION LIMITS
+# ──────────────────────────────────────────────
+def get_partition_info() -> dict[str, dict]:
+    """Limits per partition from `scontrol show partition -o`."""
+    out = run_out(["scontrol", "show", "partition", "-o"])
+    parts: dict[str, dict] = {}
+    for line in out.strip().splitlines():
+        fields = dict(
+            kv.split("=", 1) for kv in line.split() if "=" in kv
+        )
+        name = fields.get("PartitionName", "").strip()
+        if not name:
+            continue
+        parts[name] = {
+            "name":       name,
+            "max_time":   fields.get("MaxTime", ""),
+            "def_time":   fields.get("DefaultTime", ""),
+            "max_nodes":  fields.get("MaxNodes", ""),
+            "total_nodes": fields.get("TotalNodes", ""),
+            "total_cpus": fields.get("TotalCPUs", ""),
+            "def_mem_per_cpu": fields.get("DefMemPerCPU", ""),
+            "max_mem_per_node": fields.get("MaxMemPerNode", ""),
+            "state":      fields.get("State", ""),
+            "default":    fields.get("Default", "NO") == "YES",
+        }
+    return parts
+
+
+# ──────────────────────────────────────────────
+#  NODE METRICS WITHOUT SSH
+# ──────────────────────────────────────────────
+def get_node_info_scontrol(node: str) -> dict:
+    """Node usage from `scontrol show node`, which needs no SSH access.
+
+    Many sites forbid users logging into compute nodes, which made the
+    SSH-only monitor permanently blank there.  This is the default source;
+    SSH only adds per-process detail on top.
+    """
+    if not is_valid_nodename(node):
+        return {}
+    out = run_out(["scontrol", "show", "node", node, "-o"])
+    if not out.strip():
+        return {}
+    fields = dict(kv.split("=", 1) for kv in out.split() if "=" in kv)
+
+    def num(key, default=0.0):
+        try:
+            return float(fields.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    cpu_tot = num("CPUTot")
+    cpu_alloc = num("CPUAlloc")
+    real_mem = num("RealMemory")
+    alloc_mem = num("AllocMem")
+    free_mem = num("FreeMem")
+    load = num("CPULoad")
+    gres = fields.get("Gres", "") or ""
+    gres_used = fields.get("GresUsed", "") or ""
+
+    def gpu_num(text):
+        # Gres spellings: "gpu:4", "gpu:a100:4", "gpu:a100:4(IDX:0-3)".
+        # The optional middle group is the GPU model, whose own digits
+        # ("a100") must not be mistaken for the count.
+        m = re.search(r"gpu:(?:[^,()\s:]+:)?(\d+)", text or "")
+        return int(m.group(1)) if m else 0
+
+    return {
+        "node":        node,
+        "state":       fields.get("State", ""),
+        "cpu_alloc":   int(cpu_alloc),
+        "cpu_total":   int(cpu_tot),
+        "cpu_pct":     int(cpu_alloc / cpu_tot * 100) if cpu_tot else 0,
+        "load":        load,
+        "load_pct":    int(min(load / cpu_tot * 100, 100)) if cpu_tot else 0,
+        "mem_total_mb": real_mem,
+        "mem_alloc_mb": alloc_mem,
+        "mem_free_mb":  free_mem,
+        "mem_pct":     int(alloc_mem / real_mem * 100) if real_mem else 0,
+        "gpu_total":   gpu_num(gres),
+        "gpu_alloc":   gpu_num(gres_used),
+        "reason":      fields.get("Reason", ""),
+    }
+
+
+# ──────────────────────────────────────────────
+#  SUBMIT TEMPLATES
+# ──────────────────────────────────────────────
+TEMPLATE_FIELDS = ["script", "job_name", "partition", "account", "nodes",
+                   "ntasks", "gpus", "cpus", "mem", "time", "output", "error", "extra"]
+
+
+def load_templates(path: Path | None = None) -> list[dict]:
+    path = path or TEMPLATE_FILE
+    try:
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for entry in data:
+        if isinstance(entry, dict) and entry.get("name"):
+            vals = entry.get("values", {})
+            if isinstance(vals, dict):
+                out.append({"name": str(entry["name"]),
+                            "values": {k: str(v) for k, v in vals.items()
+                                       if k in TEMPLATE_FIELDS}})
+    return out
+
+
+def save_templates(templates: list[dict], path: Path | None = None) -> bool:
+    path = path or TEMPLATE_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(templates, indent=2))
+        tmp.replace(path)
+        return True
+    except Exception:
+        return False
+
+
+def upsert_template(templates: list[dict], name: str, values: dict) -> list[dict]:
+    name = (name or "").strip()
+    if not name:
+        return templates
+    clean = {k: v for k, v in values.items() if k in TEMPLATE_FIELDS}
+    for entry in templates:
+        if entry["name"] == name:
+            entry["values"] = clean
+            return templates
+    templates.append({"name": name, "values": clean})
+    return templates
+
+
+# ──────────────────────────────────────────────
+#  ARRAY RE-RUN
+# ──────────────────────────────────────────────
+TERMINAL_STATES = {"COMPLETED", "CD", "FAILED", "F", "TIMEOUT", "TO",
+                   "CANCELLED", "CA", "OUT_OF_MEMORY", "OOM", "NODE_FAIL",
+                   "NF", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+
+_ARRAY_FAIL_STATES = {"FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL",
+                      "CANCELLED", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
+
+
+def aggregate_efficiency(records: dict[str, dict]) -> dict:
+    """Roll per-job efficiency records up into cluster-citizenship figures."""
+    usable = [r for r in records.values()
+              if r.get("cpu_eff") is not None or r.get("mem_eff") is not None]
+    if not usable:
+        return {}
+    cpu_effs = [r["cpu_eff"] for r in usable if r.get("cpu_eff") is not None]
+    mem_effs = [r["mem_eff"] for r in usable if r.get("mem_eff") is not None]
+    core_hours = sum(r.get("cpu_hours", 0.0) for r in usable)
+    # Core-hours reserved but never used, the figure an HPC admin cares about.
+    wasted_core_hours = sum(
+        r.get("cpu_hours", 0.0) * max(0.0, 1 - (r["cpu_eff"] or 0) / 100)
+        for r in usable if r.get("cpu_eff") is not None)
+    gb_hours_reserved = sum(
+        r.get("req_mem_mb", 0.0) / 1024 * r.get("elapsed_s", 0.0) / 3600 for r in usable)
+    gb_hours_used = sum(
+        r.get("max_rss_mb", 0.0) / 1024 * r.get("elapsed_s", 0.0) / 3600 for r in usable)
+    buckets = {"0-25%": 0, "25-50%": 0, "50-75%": 0, "75-100%": 0}
+    for value in cpu_effs:
+        if value < 25:   buckets["0-25%"] += 1
+        elif value < 50: buckets["25-50%"] += 1
+        elif value < 75: buckets["50-75%"] += 1
+        else:            buckets["75-100%"] += 1
+    worst = sorted(
+        usable,
+        key=lambda r: r.get("cpu_hours", 0.0) * max(0.0, 1 - (r.get("cpu_eff") or 0) / 100),
+        reverse=True)[:10]
+    return {
+        "jobs": len(usable),
+        "mean_cpu_eff": round(sum(cpu_effs) / len(cpu_effs), 1) if cpu_effs else None,
+        "mean_mem_eff": round(sum(mem_effs) / len(mem_effs), 1) if mem_effs else None,
+        "core_hours": round(core_hours, 1),
+        "wasted_core_hours": round(wasted_core_hours, 1),
+        "gpu_hours": round(sum(r.get("gpu_hours", 0.0) for r in usable), 1),
+        "gb_hours_reserved": round(gb_hours_reserved, 1),
+        "gb_hours_used": round(gb_hours_used, 1),
+        "buckets": buckets,
+        "worst": worst,
+    }
+
+
+def failed_task_indices(tasks: list[dict]) -> list[int]:
+    """Array indices of the tasks that did not complete successfully."""
+    out = []
+    for t in tasks:
+        state = (t.get("state") or "").split()[0].upper() if t.get("state") else ""
+        if state not in _ARRAY_FAIL_STATES:
+            continue
+        jid = str(t.get("jobid", ""))
+        if "_" not in jid:
+            continue
+        idx = jid.split("_", 1)[1].split(".")[0]
+        if idx.isdigit():
+            out.append(int(idx))
+    return sorted(set(out))
+
+
+def compact_indices(indices: list[int]) -> str:
+    """[1,2,3,7,9,10] -> "1-3,7,9-10" (Slurm --array syntax)."""
+    if not indices:
+        return ""
+    idx = sorted(set(indices))
+    runs, start, prev = [], idx[0], idx[0]
+    for value in idx[1:]:
+        if value == prev + 1:
+            prev = value
+            continue
+        runs.append((start, prev))
+        start = prev = value
+    runs.append((start, prev))
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def build_array_rerun_args(submit_line: str, indices: list[int]) -> list[str] | None:
+    """sbatch argv that re-runs only `indices` of an array job.
+
+    Any --array already present is dropped, so the new selection wins rather
+    than being appended twice.
+    """
+    args = build_sbatch_args(submit_line)
+    if not args or not indices:
+        return None
+    cleaned, skip_next = [], False
+    for tok in args[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("--array=") or tok.startswith("-a="):
+            continue
+        if tok in ("--array", "-a"):
+            skip_next = True
+            continue
+        cleaned.append(tok)
+    return ["sbatch", f"--array={compact_indices(indices)}"] + cleaned
+
+
+# ──────────────────────────────────────────────
+#  COMPLETION HOOK
+# ──────────────────────────────────────────────
+def run_completion_hook(hook: str, jobid: str, state: str, name: str) -> None:
+    """Fire the user's completion hook. Never raises, never blocks the UI."""
+    hook = (hook or "").strip()
+    if not hook:
+        return
+    hook_path = os.path.expanduser(hook)
+    if not (os.path.isfile(hook_path) and os.access(hook_path, os.X_OK)):
+        return
+    try:
+        with open(os.devnull, "r") as devnull:
+            subprocess.run(
+                [hook_path, str(jobid), str(state), str(name)],
+                stdin=devnull, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=10, close_fds=True,
+            )
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────
 #  MODAL: CONFIRM
 # ──────────────────────────────────────────────
 class SubmitJobModal(ModalScreen):
@@ -1080,24 +1839,35 @@ class SubmitJobModal(ModalScreen):
     DEFAULT_CSS = """
     SubmitJobModal { align: center middle; }
     #submit-dialog {
-        width: 90%; max-width: 88; background: #161b22; border: solid #30363d;
+        width: 90%; max-width: 88; height: 90%; max-height: 40;
+        background: #161b22; border: solid #30363d;
         padding: 1 2; layout: vertical;
     }
+    /* The form outgrew a short terminal once ntasks was added, so the
+       fields scroll while the buttons stay pinned to the bottom. */
+    #submit-fields { height: 1fr; }
     #submit-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
+    #partition-hint { color: #6e7681; height: auto; }
     .field-row { height: 3; layout: horizontal; margin-bottom: 0; }
     .field-lbl { width: 18; color: #8b949e; content-align: right middle; padding-right: 1; }
     .field-inp { width: 1fr; height: 3; border: solid #30363d; background: #0d1117; color: #c9d1d9; }
     .field-inp:focus { border: solid #58a6ff; }
     #submit-btn-row { height: 3; layout: horizontal; margin-top: 1; }
-    #btn-submit-run    { background: #238636; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-submit-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    #btn-submit-run    { background: #238636; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-save   { background: #1f6feb; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-load   { background: #6e40c9; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 10; }
     #btn-submit-run:hover    { background: #2ea043; }
+    #btn-submit-save:hover   { background: #388bfd; }
+    #btn-submit-load:hover   { background: #8957e5; }
     #btn-submit-cancel:hover { background: #30363d; }
     #submit-status { color: #8b949e; margin-top: 1; }
     """
 
-    def __init__(self):
+    def __init__(self, initial: dict | None = None):
         super().__init__()
+        self._initial = initial or {}
+        self._partitions: dict[str, dict] = {}
 
     def _field(self, label: str, fid: str, placeholder: str, val: str = ""):
         with Horizontal(classes="field-row"):
@@ -1106,45 +1876,148 @@ class SubmitJobModal(ModalScreen):
                         classes="field-inp")
 
     def compose(self) -> ComposeResult:
+        v = self._initial
         with Vertical(id="submit-dialog"):
             yield Label("🚀  Submit new job (sbatch)", id="submit-title")
-            yield from self._field("Script (.sh):",  "script",    "/path/to/job.sh")
-            yield from self._field("Job name:",      "job_name",  "my_job")
-            yield from self._field("Partition:",      "partition", "gpu_part")
-            yield from self._field("Account:",       "account",   "my_account")
-            yield from self._field("Nodes:",         "nodes",     "1")
-            yield from self._field("GPUs per node:", "gpus",      "4")
-            yield from self._field("CPUs per task:", "cpus",      "40")
-            yield from self._field("Memory:",        "mem",       "64G")
-            yield from self._field("Max time:",       "time",      "2:00:00")
-            yield from self._field("Output log:",    "output",    "logs/%j.out")
-            yield from self._field("Error log:",     "error",     "logs/%j.err")
-            yield from self._field("Args extra:",    "extra",     "--exclusive")
+            with VerticalScroll(id="submit-fields"):
+                yield from self._field("Script (.sh):",  "script",    "/path/to/job.sh", v.get("script", ""))
+                yield from self._field("Job name:",      "job_name",  "my_job",          v.get("job_name", ""))
+                yield from self._field("Partition:",     "partition", "gpu_part",        v.get("partition", ""))
+                yield from self._field("Account:",       "account",   "my_account",      v.get("account", ""))
+                yield from self._field("Nodes:",         "nodes",     "1",               v.get("nodes", ""))
+                yield from self._field("Tasks (ntasks):", "ntasks",   "1",               v.get("ntasks", ""))
+                yield from self._field("GPUs per node:", "gpus",      "4",               v.get("gpus", ""))
+                yield from self._field("CPUs per task:", "cpus",      "40",              v.get("cpus", ""))
+                yield from self._field("Memory:",        "mem",       "64G",             v.get("mem", ""))
+                yield from self._field("Max time:",      "time",      "2:00:00",         v.get("time", ""))
+                yield from self._field("Output log:",    "output",    "logs/%j.out",     v.get("output", ""))
+                yield from self._field("Error log:",     "error",     "logs/%j.err",     v.get("error", ""))
+                yield from self._field("Args extra:",    "extra",     "--exclusive",     v.get("extra", ""))
+            yield Label("", id="partition-hint")
             with Horizontal(id="submit-btn-row"):
-                yield Button("▶  Submit job",          id="btn-submit-run")
-                yield Button("✕  Close",              id="btn-submit-cancel")
+                yield Button("▶  Submit",       id="btn-submit-run")
+                yield Button("💾  Save tpl",     id="btn-submit-save")
+                yield Button("📑  Load tpl",     id="btn-submit-load")
+                yield Button("✕  Close",        id="btn-submit-cancel")
             yield Label("", id="submit-status")
 
+    def on_mount(self) -> None:
+        self._load_partitions()
+
+    @work(thread=True)
+    def _load_partitions(self) -> None:
+        info = get_partition_info()
+        self.app.call_from_thread(self._apply_partitions, info)
+
+    def _apply_partitions(self, info: dict) -> None:
+        if not self.is_attached:
+            return
+        self._partitions = info
+        names = ", ".join(sorted(info)) or "(none reported)"
+        self.query_one("#partition-hint", Label).update(
+            f"  Partitions: {names[:110]}")
+        self._update_partition_hint()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "si-partition":
+            self._update_partition_hint()
+
+    def _update_partition_hint(self) -> None:
+        """Show the selected partition's limits, so a request that the
+        partition can never satisfy is visible before sbatch rejects it."""
+        if not self.is_attached or not self._partitions:
+            return
+        hint = self.query_one("#partition-hint", Label)
+        try:
+            chosen = self.query_one("#si-partition", Input).value.strip()
+        except Exception:
+            return
+        if not chosen:
+            names = ", ".join(sorted(self._partitions))
+            hint.update(f"  Partitions: {names[:110]}")
+            return
+        p = self._partitions.get(chosen)
+        if not p:
+            close = [n for n in self._partitions if n.startswith(chosen)]
+            hint.update(f"  [yellow]Unknown partition '{chosen}'[/]"
+                        + (f" — did you mean {', '.join(close[:4])}?" if close else ""))
+            return
+        bits = [f"MaxTime {p['max_time']}"]
+        if p["max_nodes"]:        bits.append(f"MaxNodes {p['max_nodes']}")
+        if p["def_mem_per_cpu"]:  bits.append(f"DefMem/CPU {p['def_mem_per_cpu']}M")
+        if p["max_mem_per_node"]: bits.append(f"MaxMem/Node {p['max_mem_per_node']}M")
+        bits.append(f"State {p['state']}")
+        hint.update(f"  [#58a6ff]{chosen}[/]: " + "  ·  ".join(bits))
+
     def _get_values(self) -> dict:
-        fields = ["script","job_name","partition","account","nodes",
-                  "gpus","cpus","mem","time","output","error","extra"]
-        return {f: self.query_one(f"#si-{f}", Input).value.strip() for f in fields}
+        return {f: self.query_one(f"#si-{f}", Input).value.strip()
+                for f in TEMPLATE_FIELDS}
+
+    def _set_values(self, values: dict) -> None:
+        for field in TEMPLATE_FIELDS:
+            try:
+                self.query_one(f"#si-{field}", Input).value = values.get(field, "")
+            except Exception:
+                pass
+        self._update_partition_hint()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id
+        status = self.query_one("#submit-status", Label)
         if bid == "btn-submit-cancel":
             self.dismiss(None)
+        elif bid == "btn-submit-save":
+            vals = self._get_values()
+            if not vals.get("script"):
+                status.update("[bold red]✗ Nothing to save — fill the form first[/]")
+                return
+            self.app.push_screen(
+                TextPromptModal("💾  Save template as", "e.g. gpu-training",
+                                vals.get("job_name", "")),
+                callback=lambda name: self._save_template(name, vals))
+        elif bid == "btn-submit-load":
+            self.app.push_screen(TemplatePickerModal(load_templates()),
+                                 callback=self._template_chosen)
         elif bid == "btn-submit-run":
             vals = self._get_values()
             if not vals.get("script"):
-                self.query_one("#submit-status", Label).update(
-                    "[bold red]✗ A script path is required[/]")
+                status.update("[bold red]✗ A script path is required[/]")
+                return
+            script = os.path.expanduser(vals["script"])
+            if not os.path.isfile(script):
+                status.update(f"[bold red]✗ Script not found: {script}[/]")
                 return
             # sbatch has a 30 s timeout — running it inline froze the whole
             # TUI until the controller answered.
-            self.query_one("#submit-status", Label).update("[dim]Submitting…[/]")
+            status.update("[dim]Submitting…[/]")
             event.button.disabled = True
             self._worker_submit(vals)
+
+    # ── templates ──────────────────────────────────────────────────────
+    def _save_template(self, name: str | None, values: dict) -> None:
+        if not name:
+            return
+        templates = upsert_template(load_templates(), name, values)
+        status = self.query_one("#submit-status", Label)
+        if save_templates(templates):
+            status.update(f"[bold green]✓ Template '{name}' saved[/]")
+        else:
+            status.update(f"[bold red]✗ Could not write {TEMPLATE_FILE}[/]")
+
+    def _template_chosen(self, result) -> None:
+        if not result:
+            return
+        action, entry = result
+        status = self.query_one("#submit-status", Label)
+        if action == "load":
+            self._set_values(entry["values"])
+            status.update(f"[bold green]✓ Loaded template '{entry['name']}'[/]")
+        elif action == "delete":
+            remaining = [t for t in load_templates() if t["name"] != entry["name"]]
+            if save_templates(remaining):
+                status.update(f"[bold yellow]Template '{entry['name']}' deleted[/]")
+            else:
+                status.update("[bold red]✗ Could not update the template file[/]")
 
     @work(thread=True)
     def _worker_submit(self, vals: dict) -> None:
@@ -1178,13 +2051,20 @@ class ArrayJobModal(ModalScreen):
     #array-title  { color: #f0883e; text-style: bold; margin-bottom: 1; }
     #array-table  { height: 1fr; }
     #array-summary { color: #8b949e; margin-top: 1; }
+    #array-btn-row { height: 3; margin-top: 1; align: left middle; }
+    #btn-array-rerun { background: #1f6feb; color: white; border: none;
+                       min-width: 26; margin-right: 1; }
+    #btn-array-rerun:hover { background: #388bfd; }
+    #btn-array-rerun.disabled { background: #21262d; color: #484f58; }
     #btn-array-close { background: #21262d; color: #c9d1d9; border: none;
-                       min-width: 14; margin-top: 1; }
+                       min-width: 14; }
     """
 
     def __init__(self, jobid: str):
         super().__init__()
         self._jobid = jobid
+        self._tasks: list[dict] = []
+        self._failed: list[int] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="array-dialog"):
@@ -1193,7 +2073,9 @@ class ArrayJobModal(ModalScreen):
             tbl.add_columns("TASK ID", "NAME",   "STATE",  "EXIT", "ELAPSED", "NODES", "START")
             yield tbl
             yield Label("", id="array-summary")
-            yield Button("✕  Close  [Esc]", id="btn-array-close")
+            with Horizontal(id="array-btn-row"):
+                yield Button("↻  Rerun failed tasks", id="btn-array-rerun")
+                yield Button("✕  Close  [Esc]", id="btn-array-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -1208,6 +2090,15 @@ class ArrayJobModal(ModalScreen):
         # detached screen raises NoMatches inside call_from_thread.
         if not self.is_attached:
             return
+        self._tasks = tasks
+        self._failed = failed_task_indices(tasks)
+        btn = self.query_one("#btn-array-rerun", Button)
+        if self._failed:
+            btn.label = f"↻  Rerun {len(self._failed)} failed task(s)"
+            btn.set_class(False, "disabled")
+        else:
+            btn.label = "↻  No failed tasks"
+            btn.set_class(True, "disabled")
         tbl = self.query_one("#array-table", DataTable)
         if not tasks:
             self.query_one("#array-title", Label).update(
@@ -1243,6 +2134,56 @@ class ArrayJobModal(ModalScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-array-close":
             self.dismiss(None)
+        elif event.button.id == "btn-array-rerun":
+            self._start_rerun()
+
+    def _start_rerun(self) -> None:
+        if not self._failed:
+            self.app.notify("No failed tasks to rerun", severity="warning")
+            return
+        self.app.notify("Recovering the original submit line…", timeout=3)
+        self._worker_prepare_rerun()
+
+    @work(thread=True)
+    def _worker_prepare_rerun(self) -> None:
+        base = self._jobid.split("_")[0]
+        submit_line = get_submit_line(base)
+        args = build_array_rerun_args(submit_line, self._failed) if submit_line else None
+        self.app.call_from_thread(self._confirm_rerun, args, submit_line)
+
+    def _confirm_rerun(self, args: list[str] | None, submit_line: str) -> None:
+        if not self.is_attached:
+            return
+        if not args:
+            detail = (f"Recovered line is not an sbatch command:\n{submit_line}"
+                      if submit_line else
+                      "sacct/scontrol did not return the original submit line.")
+            self.app.notify(f"Cannot rebuild the submission. {detail}",
+                            severity="error", timeout=8)
+            return
+        preview = " ".join(shlex.quote(a) for a in args)
+        self.app.push_screen(
+            ConfirmModal("↻  Rerun failed array tasks",
+                         f"{len(self._failed)} task(s): "
+                         f"{compact_indices(self._failed)}\n\n{preview[:200]}"),
+            callback=lambda ok: self._do_rerun(ok, args))
+
+    def _do_rerun(self, confirmed: bool, args: list[str]) -> None:
+        if confirmed:
+            self._worker_submit_rerun(args)
+
+    @work(thread=True)
+    def _worker_submit_rerun(self, args: list[str]) -> None:
+        ok, msg = run_sbatch(args)
+        self.app.call_from_thread(self._rerun_done, ok, msg)
+
+    def _rerun_done(self, ok: bool, msg: str) -> None:
+        if ok:
+            self.app.notify(f"Failed tasks resubmitted: {msg}",
+                            severity="information", timeout=7)
+            self.dismiss(None)
+        else:
+            self.app.notify(f"Resubmission failed: {msg}", severity="error", timeout=8)
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -1322,6 +2263,385 @@ class DependencyTreeModal(ModalScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-dep-close":
             self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+class EfficiencyModal(ModalScreen):
+    """seff-style report: what a job reserved versus what it actually used."""
+    DEFAULT_CSS = """
+    EfficiencyModal { align: center middle; }
+    #eff-dialog { width: 92%; max-width: 92; height: 80%; max-height: 34;
+                  background: #161b22; border: solid #1f6feb; padding: 1 2;
+                  layout: vertical; }
+    #eff-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
+    #eff-log   { height: 1fr; border: solid #21262d; background: #0d1117; }
+    #btn-eff-close { background: #21262d; color: #c9d1d9; border: none;
+                     min-width: 14; margin-top: 1; }
+    """
+
+    def __init__(self, jobid: str, job_name: str = "") -> None:
+        super().__init__()
+        self._jobid = jobid
+        self._job_name = job_name
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="eff-dialog"):
+            yield Label(f"Efficiency for job {self._jobid} — loading…", id="eff-title")
+            yield RichLog(id="eff-log", highlight=False, markup=False, wrap=False)
+            yield Button("✕  Close  [Esc]", id="btn-eff-close")
+
+    def on_mount(self) -> None:
+        self._worker_load()
+
+    @work(thread=True)
+    def _worker_load(self) -> None:
+        data = get_job_efficiency([self._jobid])
+        self.app.call_from_thread(self._render_report, data.get(self._jobid))
+
+    def _render_report(self, rec: dict | None) -> None:
+        if not self.is_attached:
+            return
+        log = self.query_one("#eff-log", RichLog)
+        title = self.query_one("#eff-title", Label)
+        if not rec:
+            title.update(f"[yellow]Efficiency — job {self._jobid}: no accounting data[/]")
+            log.write(Text("  sacct returned nothing for this job.", style="dim"))
+            log.write(Text("  Accounting may be disabled, or the job is too old.", style="dim"))
+            return
+        verdict, vstyle = efficiency_verdict(rec)
+        title.update(f"Efficiency — job [bold cyan]{self._jobid}[/] {self._job_name}")
+
+        def line(t="", s="white"):
+            log.write(Text(t, style=s))
+
+        def meter(label, pct, detail, invert_ok=False):
+            if pct is None:
+                line(f"  {label:<10} n/a   {detail}", "dim")
+                return
+            shown = min(int(pct), 100)
+            col = bar_color(100 - shown) if not invert_ok else bar_color(shown)
+            line(f"  {label:<10} [{make_bar(shown, 28)}] {pct:>6.1f}%   {detail}", col)
+
+        line(f"  State     : {rec['state']}   Exit: {rec['exitcode']}", "white")
+        line(f"  Wall time : {rec['elapsed_s']/3600:.2f} h over "
+             f"{rec['ncpus']} CPU(s) on {rec['nnodes']} node(s)", "white")
+        line("")
+        line("── EFFICIENCY " + "─" * 50, "bold #30363d")
+        meter("CPU", rec["cpu_eff"],
+              f"used {rec['totalcpu_s']/3600:.2f} h of {rec['cpu_hours']:.2f} core-hours reserved")
+        meter("Memory", rec["mem_eff"],
+              f"peak {rec['max_rss_mb']/1024:.2f} GB of {rec['req_mem_mb']/1024:.2f} GB requested")
+        line("")
+        line(f"  Verdict   : {verdict}", vstyle)
+        if rec["wasted_mem_mb"] > 0 and rec["req_mem_mb"] > 0:
+            line(f"  Unused RAM: {rec['wasted_mem_mb']/1024:.2f} GB reserved and never touched",
+                 "yellow" if rec["wasted_mem_mb"] > 1024 else "dim")
+        line("")
+        line("── RESOURCES BILLED " + "─" * 44, "bold #30363d")
+        line(f"  CPU-hours : {rec['cpu_hours']:.2f}", "#79c0ff")
+        if rec["gpus"]:
+            line(f"  GPU-hours : {rec['gpu_hours']:.2f}  ({rec['gpus']} GPU(s))", "bold #f0883e")
+        line("")
+        line("── SUGGESTION " + "─" * 50, "bold #30363d")
+        for tip in efficiency_suggestions(rec):
+            line(f"  • {tip}", "#8b949e")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-eff-close":
+            self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+class PriorityModal(ModalScreen):
+    """Explains why a pending job has not started yet."""
+    DEFAULT_CSS = """
+    PriorityModal { align: center middle; }
+    #prio-dialog { width: 92%; max-width: 92; height: 80%; max-height: 32;
+                   background: #161b22; border: solid #8957e5; padding: 1 2;
+                   layout: vertical; }
+    #prio-title { color: #a371f7; text-style: bold; margin-bottom: 1; }
+    #prio-log   { height: 1fr; border: solid #21262d; background: #0d1117; }
+    #btn-prio-close { background: #21262d; color: #c9d1d9; border: none;
+                      min-width: 14; margin-top: 1; }
+    """
+
+    def __init__(self, jobid: str, reason: str = "", partition: str = "",
+                 state: str = "") -> None:
+        super().__init__()
+        self._jobid = jobid
+        self._reason = reason
+        self._partition = partition
+        self._state = state
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prio-dialog"):
+            yield Label(f"Why is job {self._jobid} waiting? — loading…", id="prio-title")
+            yield RichLog(id="prio-log", highlight=False, markup=False, wrap=True)
+            yield Button("✕  Close  [Esc]", id="btn-prio-close")
+
+    def on_mount(self) -> None:
+        self._worker_load()
+
+    @work(thread=True)
+    def _worker_load(self) -> None:
+        prio = get_job_priority(self._jobid)
+        rank, total = get_priority_queue_position(self._jobid, self._partition)
+        share = get_fairshare()
+        est = get_start_estimates().get(self._jobid, "")
+        self.app.call_from_thread(self._render_priority, prio, rank, total, share, est)
+
+    def _render_priority(self, prio: dict, rank: int, total: int, share: dict, est: str) -> None:
+        if not self.is_attached:
+            return
+        log = self.query_one("#prio-log", RichLog)
+        self.query_one("#prio-title", Label).update(
+            f"Why is job [bold cyan]{self._jobid}[/] waiting?")
+
+        def line(t="", s="white"):
+            log.write(Text(t, style=s))
+
+        reason = (self._reason or "").strip()
+        line("── BLOCKING REASON " + "─" * 45, "bold #30363d")
+        line(f"  Slurm reports: {reason or '(none recorded)'}", "bold yellow")
+        explanation = explain_pending_reason(reason)
+        if explanation:
+            line(f"  {explanation}", "white")
+        if est:
+            line(f"  Estimated start: {est}", "bold cyan")
+        line("")
+
+        if rank and total:
+            line("── QUEUE POSITION " + "─" * 46, "bold #30363d")
+            scope = f"partition {self._partition}" if self._partition else "the cluster"
+            line(f"  #{rank} of {total} pending jobs in {scope}", "white")
+            pct = int((1 - (rank - 1) / total) * 100) if total else 0
+            line(f"  [{make_bar(pct, 30)}] ahead of {pct}% of the queue", bar_color(pct))
+            line("")
+
+        if prio:
+            line("── PRIORITY BREAKDOWN " + "─" * 42, "bold #30363d")
+            line(f"  Total priority: {prio['total']}", "bold white")
+            factors = [("Age", prio["age"]), ("Fairshare", prio["fairshare"]),
+                       ("Job size", prio["jobsize"]), ("Partition", prio["partition"]),
+                       ("QOS", prio["qos"]), ("TRES", prio["tres"])]
+            biggest = max((v for _, v in factors), default=0) or 1
+            for label, value in factors:
+                width = int(24 * value / biggest)
+                line(f"  {label:<12} {value:>8}  {'█' * width}", "#79c0ff")
+            if prio.get("nice"):
+                line(f"  Nice penalty {prio['nice']:>8}", "dim")
+            dominant = max(factors, key=lambda kv: kv[1])[0] if any(v for _, v in factors) else ""
+            if dominant:
+                line(f"  Largest contribution: {dominant}", "dim")
+            line("")
+        else:
+            line("  (sprio is unavailable on this cluster — no priority breakdown)", "dim")
+            line("")
+
+        if share:
+            line("── YOUR FAIRSHARE " + "─" * 46, "bold #30363d")
+            fs = share["fairshare"]
+            pct = int(max(0.0, min(1.0, fs)) * 100)
+            line(f"  Fairshare factor: {fs:.4f}  [{make_bar(pct, 24)}]", bar_color(pct))
+            line(f"  Effective usage : {share['effective_usage']:.4f}"
+                 f"   Account: {share['account']}", "dim")
+            if fs < 0.2:
+                line("  Your recent usage is high, which lowers the priority of new jobs.",
+                     "yellow")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-prio-close":
+            self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+class TextPromptModal(ModalScreen[str | None]):
+    """One-line text prompt. Returns the entered text, or None if cancelled."""
+    DEFAULT_CSS = """
+    TextPromptModal { align: center middle; }
+    #prompt-box { width: 80%; max-width: 64; height: auto; background: #161b22;
+                  border: solid #1f6feb; padding: 1 2; }
+    #prompt-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
+    #prompt-input { border: solid #30363d; background: #0d1117; color: #c9d1d9; }
+    #prompt-input:focus { border: solid #58a6ff; }
+    #prompt-buttons { height: 3; margin-top: 1; align: right middle; }
+    #btn-prompt-ok { background: #238636; color: white; border: none; min-width: 12; margin-right: 1; }
+    #btn-prompt-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    """
+
+    def __init__(self, title: str, placeholder: str = "", value: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._placeholder = placeholder
+        self._value = value
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="prompt-box"):
+            yield Label(self._title, id="prompt-title")
+            yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input")
+            with Horizontal(id="prompt-buttons"):
+                yield Button("✓  OK", id="btn-prompt-ok")
+                yield Button("✕  Cancel", id="btn-prompt-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt-input", Input).focus()
+
+    def _submit(self) -> None:
+        self.dismiss(self.query_one("#prompt-input", Input).value.strip() or None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-prompt-ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._submit()
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+class TemplatePickerModal(ModalScreen):
+    """Pick a saved submit template, or delete one."""
+    DEFAULT_CSS = """
+    TemplatePickerModal { align: center middle; }
+    #tpl-box { width: 80%; max-width: 70; height: auto; max-height: 28;
+               background: #161b22; border: solid #1f6feb; padding: 1 2; }
+    #tpl-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
+    #tpl-table { height: auto; max-height: 16; }
+    #tpl-buttons { height: 3; margin-top: 1; align: left middle; }
+    #btn-tpl-load   { background: #238636; color: white; border: none; min-width: 14; margin-right: 1; }
+    #btn-tpl-delete { background: #da3633; color: white; border: none; min-width: 14; margin-right: 1; }
+    #btn-tpl-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    """
+
+    def __init__(self, templates: list[dict]) -> None:
+        super().__init__()
+        self._templates = templates
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="tpl-box"):
+            yield Label("📑  Saved templates", id="tpl-title")
+            tbl = DataTable(id="tpl-table")
+            tbl.cursor_type = "row"
+            tbl.add_columns("NAME", "SCRIPT", "PARTITION", "CPUs", "MEM", "TIME")
+            yield tbl
+            with Horizontal(id="tpl-buttons"):
+                yield Button("▶  Load", id="btn-tpl-load")
+                yield Button("🗑  Delete", id="btn-tpl-delete")
+                yield Button("✕  Cancel  [Esc]", id="btn-tpl-cancel")
+
+    def on_mount(self) -> None:
+        tbl = self.query_one("#tpl-table", DataTable)
+        if not self._templates:
+            tbl.add_row(Text("(no templates saved yet)", style="dim italic"),
+                        *[Text("") for _ in range(5)])
+            return
+        for t in self._templates:
+            v = t["values"]
+            tbl.add_row(
+                Text(t["name"], style="bold yellow"),
+                Text(os.path.basename(v.get("script", ""))[:24]),
+                Text(v.get("partition", "")), Text(v.get("cpus", "")),
+                Text(v.get("mem", "")), Text(v.get("time", "")),
+            )
+
+    def _selected(self) -> dict | None:
+        tbl = self.query_one("#tpl-table", DataTable)
+        if not self._templates or tbl.row_count == 0:
+            return None
+        idx = tbl.cursor_row
+        return self._templates[idx] if 0 <= idx < len(self._templates) else None
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-tpl-cancel":
+            self.dismiss(None)
+        elif bid == "btn-tpl-load":
+            entry = self._selected()
+            self.dismiss(("load", entry) if entry else None)
+        elif bid == "btn-tpl-delete":
+            entry = self._selected()
+            self.dismiss(("delete", entry) if entry else None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+
+
+class BulkCancelModal(ModalScreen[list | None]):
+    """Cancel several jobs at once behind a typed confirmation."""
+    DEFAULT_CSS = """
+    BulkCancelModal { align: center middle; }
+    #bulk-box { width: 88%; max-width: 78; height: auto; max-height: 30;
+                background: #161b22; border: double #f85149; padding: 1 2; }
+    #bulk-title { color: #f85149; text-style: bold; margin-bottom: 1; }
+    #bulk-list { height: auto; max-height: 14; border: solid #21262d;
+                 background: #0d1117; margin-bottom: 1; }
+    #bulk-warn { color: #d29922; margin-bottom: 1; }
+    #bulk-input { border: solid #30363d; background: #0d1117; color: #c9d1d9; }
+    #bulk-input:focus { border: solid #f85149; }
+    #bulk-buttons { height: 3; margin-top: 1; align: right middle; }
+    #btn-bulk-go { background: #da3633; color: white; border: none; min-width: 18; margin-right: 1; }
+    #btn-bulk-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    """
+    CONFIRM_WORD = "CANCEL"
+
+    def __init__(self, jobs: list[dict], description: str) -> None:
+        super().__init__()
+        self._jobs = jobs
+        self._description = description
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="bulk-box"):
+            yield Label(f"⚠  Cancel {len(self._jobs)} job(s) — {self._description}",
+                        id="bulk-title")
+            yield RichLog(id="bulk-list", highlight=False, markup=False, wrap=False)
+            yield Label(f"This cannot be undone. Type {self.CONFIRM_WORD} to confirm:",
+                        id="bulk-warn")
+            yield Input(placeholder=self.CONFIRM_WORD, id="bulk-input")
+            with Horizontal(id="bulk-buttons"):
+                yield Button(f"⚠  Cancel {len(self._jobs)} jobs", id="btn-bulk-go")
+                yield Button("✕  Go back  [Esc]", id="btn-bulk-cancel")
+
+    def on_mount(self) -> None:
+        log = self.query_one("#bulk-list", RichLog)
+        for j in self._jobs[:60]:
+            log.write(Text(
+                f"  {j.get('jobid',''):<12} {j.get('state',''):<10} "
+                f"{j.get('partition',''):<12} {j.get('name','')[:28]}",
+                style="white"))
+        if len(self._jobs) > 60:
+            log.write(Text(f"  … and {len(self._jobs) - 60} more", style="dim"))
+        self.query_one("#bulk-input", Input).focus()
+
+    def _try_confirm(self) -> None:
+        typed = self.query_one("#bulk-input", Input).value.strip()
+        if typed != self.CONFIRM_WORD:
+            self.query_one("#bulk-warn", Label).update(
+                f"[bold red]Type {self.CONFIRM_WORD} exactly to confirm.[/]")
+            return
+        self.dismiss([j["jobid"] for j in self._jobs])
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-bulk-go":
+            self._try_confirm()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self._try_confirm()
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -1541,7 +2861,7 @@ class ResourceMonitorModal(ModalScreen):
     """
 
     _timer: Timer | None = None
-    REFRESH_SECS = 8     # resource monitor (ssh to nodes, more expensive)
+    REFRESH_SECS = CONFIG["monitor"]["refresh_interval"]
 
     def __init__(self, jobid: str, job_name: str = "", state: str = "") -> None:
         super().__init__()
@@ -1635,23 +2955,53 @@ class ResourceMonitorModal(ModalScreen):
 
         # ── NODES ──
         nodes = get_job_nodes(jobid)
+        use_ssh   = CONFIG["monitor"]["use_ssh"]
+        max_nodes = CONFIG["monitor"]["max_nodes"]
         if not nodes:
             sep("NODES")
             lines.append(("  No nodes assigned (job still PENDING?)", "dim"))
         else:
-            for node in nodes[:8]:  # limit to 8 nodes to avoid overflow
+            for node in nodes[:max_nodes]:
                 sep(f"NODE: {node}")
 
-                # ── GPU ──
+                # ── Allocation, straight from the controller (no SSH) ──
+                info = get_node_info_scontrol(node)
+                if info:
+                    cpu_pct = info["cpu_pct"]
+                    lines.append((
+                        f"  CPU  [{make_bar(cpu_pct, 20)}] {cpu_pct:>3}%   "
+                        f"{info['cpu_alloc']}/{info['cpu_total']} cores allocated"
+                        f"   Load: {info['load']:.2f}",
+                        bar_color(cpu_pct)))
+                    mem_pct = info["mem_pct"]
+                    lines.append((
+                        f"  MEM  [{make_bar(mem_pct, 20)}] {mem_pct:>3}%   "
+                        f"{info['mem_alloc_mb']/1024:.1f} / {info['mem_total_mb']/1024:.1f} GB allocated"
+                        f"   (free {info['mem_free_mb']/1024:.1f} GB)",
+                        bar_color(mem_pct)))
+                    if info["gpu_total"]:
+                        gpu_pct = int(info["gpu_alloc"] / info["gpu_total"] * 100)
+                        lines.append((
+                            f"  GPU  [{make_bar(gpu_pct, 20)}] {gpu_pct:>3}%   "
+                            f"{info['gpu_alloc']}/{info['gpu_total']} GPUs allocated",
+                            bar_color(gpu_pct)))
+                    lines.append((f"  State: {info['state']}", "dim"))
+                else:
+                    lines.append(("  (scontrol returned no data for this node)", "dim"))
+
+                if not use_ssh:
+                    continue
+
+                # ── Live utilisation, only if SSH to compute nodes is allowed ──
                 gpus = get_node_gpu_info(node)
                 if gpus:
+                    lines.append(("  ── live via ssh ───────────────────────────────────", "#30363d"))
                     lines.append(("  GPU  IDX  NAME                      UTIL       MEM USED / TOTAL       TEMP    POWER", "bold #58a6ff"))
                     for g in gpus:
                         util_bar = make_bar(g["util"], 16)
                         util_col = bar_color(g["util"])
                         mem_pct  = int(g["mem_used"] / g["mem_total"] * 100) if g["mem_total"] > 0 else 0
                         mem_bar  = make_bar(mem_pct, 16)
-                        mem_col  = bar_color(mem_pct)
                         lines.append((
                             f"  GPU  [{g['index']:>2}]  {g['name']:<24}  "
                             f"[{util_bar}] {g['util']:>3}%  "
@@ -1659,28 +3009,21 @@ class ResourceMonitorModal(ModalScreen):
                             f"{g['temp']:>4}°C  {g['power']:>6}W",
                             util_col
                         ))
-                else:
-                    lines.append(("  GPU  (no GPUs or no nvidia-smi access on this node)", "dim"))
-
-                # ── CPU / MEM ──
-                cpu_mem = get_node_cpu_mem(node)
-                cpu_pct = cpu_mem["cpu_pct"]
-                mem_pct = cpu_mem["mem_pct"]
-                mem_used_gb = cpu_mem["mem_used_kb"] / 1024 / 1024
-                mem_total_gb = cpu_mem["mem_total_kb"] / 1024 / 1024
-
-                cpu_bar = make_bar(cpu_pct, 20)
-                mem_bar_s = make_bar(mem_pct, 20)
-
-                lines.append((f"  CPU  [{cpu_bar}] {cpu_pct:>3}%   Load: {cpu_mem['load']}", bar_color(cpu_pct)))
-                lines.append((
-                    f"  MEM  [{mem_bar_s}] {mem_pct:>3}%   "
-                    f"{mem_used_gb:.1f} / {mem_total_gb:.1f} GB",
-                    bar_color(mem_pct)
-                ))
+                live = get_node_cpu_mem(node)
+                if live.get("mem_total_kb"):
+                    if not gpus:
+                        lines.append(("  ── live via ssh ───────────────────────────────────", "#30363d"))
+                    used_gb  = live["mem_used_kb"] / 1024 / 1024
+                    total_gb = live["mem_total_kb"] / 1024 / 1024
+                    lines.append((
+                        f"  USED [{make_bar(live['mem_pct'], 20)}] {live['mem_pct']:>3}%   "
+                        f"{used_gb:.1f} / {total_gb:.1f} GB in use   "
+                        f"CPU {live['cpu_pct']}%",
+                        bar_color(live["mem_pct"])))
 
         sep()
-        lines.append((f"  Last update: {ts}  │  Job {jobid}", "dim"))
+        source = "scontrol + ssh" if CONFIG["monitor"]["use_ssh"] else "scontrol only (ssh disabled)"
+        lines.append((f"  Last update: {ts}  │  Job {jobid}  │  source: {source}", "dim"))
 
         self.app.call_from_thread(self._apply_monitor, lines, ts)
 
@@ -1726,13 +3069,26 @@ class LogViewerModal(ModalScreen):
         align: left middle; padding: 0 2;
     }
     #log-keys-label { color: #3d444d; }
+    #log-search-row {
+        height: 3; background: #161b22; border-top: solid #30363d;
+        align: left middle; padding: 0 2;
+    }
+    #log-search-lbl { color: #8b949e; margin-right: 1; width: 10; }
+    #log-search { width: 1fr; max-width: 48; border: solid #30363d;
+                  background: #0d1117; color: #c9d1d9; margin-right: 2; }
+    #log-search:focus { border: solid #58a6ff; }
+    #log-match-lbl { color: #3fb950; }
+    #btn-errors-only { background: #21262d; color: #c9d1d9; border: none;
+                       min-width: 18; margin-left: 2; }
+    #btn-errors-only.on { background: #9e6a03; color: white; }
     """
 
     _showing: str = "stdout"
     _live: bool = True
     _current_path: str = ""
     _timer: Timer | None = None
-    LIVE_REFRESH_SECS = 5
+    LIVE_REFRESH_SECS = CONFIG["logs"]["live_refresh"]
+    MAX_BUFFER_LINES = 5000     # kept in memory so search can look back
 
     def __init__(self, jobid: str, stdout_path: str, stderr_path: str,
                  job_name: str = "", state: str = "", live: bool = True) -> None:
@@ -1743,6 +3099,12 @@ class LogViewerModal(ModalScreen):
         self._job_name     = job_name
         self._state        = state
         self._live         = live
+        # Full text kept per stream so search filters instantly and the
+        # auto-tail only has to read the bytes that were appended.
+        self._buffers: dict[str, list[str]] = {"stdout": [], "stderr": []}
+        self._offsets: dict[str, int] = {"stdout": 0, "stderr": 0}
+        self._filter = ""
+        self._errors_only = False
 
     def compose(self) -> ComposeResult:
         live_indicator = "  🔴 LIVE" if self._live else "  📁 HISTORY"
@@ -1754,9 +3116,16 @@ class LogViewerModal(ModalScreen):
                 yield Button("⚠  stderr", id="btn-show-stderr")
                 yield Label("", id="path-label")
             yield RichLog(id="log-content", highlight=True, markup=False, wrap=True)
+            with Horizontal(id="log-search-row"):
+                yield Label("🔎 Filter:", id="log-search-lbl")
+                yield Input(placeholder="text or /regex/ …  (press / to focus)",
+                            id="log-search")
+                yield Label("", id="log-match-lbl")
+                yield Button("⚠  Errors only", id="btn-errors-only")
             with Horizontal(id="log-keys-row"):
                 yield Label(
-                    "  Tab/S+Tab: buttons  │  ↑↓: scroll  │  PgUp/PgDn  │  r: refresh  │  e: open editor  │  Esc: close"
+                    "  /: search  │  ↑↓: scroll  │  PgUp/PgDn  │  r: refresh  │  "
+                    "e: editor  │  Esc: close"
                     + (f"  │  auto-tail {self.LIVE_REFRESH_SECS}s" if self._live else ""),
                     id="log-keys-label"
                 )
@@ -1782,9 +3151,29 @@ class LogViewerModal(ModalScreen):
         elif bid == "btn-log-refresh":  self._show_stream(self._showing)
         elif bid == "btn-open-editor":  self._pick_editor()
         elif bid == "btn-log-close":    self._close()
+        elif bid == "btn-errors-only":
+            self._errors_only = not self._errors_only
+            event.button.set_class(self._errors_only, "on")
+            self._refresh_view()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "log-search":
+            self._filter = event.value
+            self._refresh_view()
 
     def on_key(self, event) -> None:
-        if   event.key == "escape":    self._close()
+        search = self.query_one("#log-search", Input)
+        if self.focused is search:
+            # Let the user type freely; only Esc leaves the search box.
+            if event.key == "escape":
+                search.value = ""
+                self._filter = ""
+                self._refresh_view()
+                self.query_one("#log-content", RichLog).focus()
+                event.stop()
+            return
+        if   event.key == "slash":     search.focus(); event.stop()
+        elif event.key == "escape":    self._close()
         elif event.key == "r":         self._show_stream(self._showing)
         elif event.key == "e":         self._pick_editor()
         elif event.key == "up":        self.query_one("#log-content", RichLog).scroll_relative(y=-3)
@@ -1822,49 +3211,126 @@ class LogViewerModal(ModalScreen):
 
     # ── Log helpers ─────────────────────────────────────────────────────────
 
+    ERROR_KEYS   = ("error", "exception", "traceback", "fatal", "oom",
+                    "segfault", "core dumped", "cuda error")
+    WARN_KEYS    = ("warning", "warn", "deprecat")
+    SUCCESS_KEYS = ("success", "done", "finished", "completed")
+
+    @classmethod
+    def line_style(cls, line: str) -> str:
+        lower = line.lower()
+        if any(k in lower for k in cls.ERROR_KEYS):
+            return "bold red"
+        if any(k in lower for k in cls.WARN_KEYS):
+            return "yellow"
+        if any(k in lower for k in cls.SUCCESS_KEYS):
+            return "bold green"
+        return "#c9d1d9"
+
     @work(thread=True, exclusive=True, group="logview")
     def _show_stream(self, which: str) -> None:
-        """Load and display a log stream (runs in a background thread)."""
+        """Read whatever is new on this stream (runs in a background thread)."""
         self._showing = which
         path = self._stdout_path if which == "stdout" else self._stderr_path
 
         if not path or not os.path.exists(path):
             msg = f"(File not found: {path})" if path else "(No path available)"
-            self.app.call_from_thread(self._apply_log_content, which, path, msg)
+            self.app.call_from_thread(self._apply_stream_error, which, path, msg)
             return
 
-        try:
-            content = tail_file(path)
-        except Exception as e:
-            content = f"(Error reading file: {e})"
+        lines, offset, reset = follow_file(path, self._offsets.get(which, 0),
+                                           LOG_TAIL_LINES)
+        self.app.call_from_thread(self._apply_stream_lines,
+                                  which, path, lines, offset, reset)
 
-        self.app.call_from_thread(self._apply_log_content, which, path, content)
-
-    def _apply_log_content(self, which: str, path: str, content: str) -> None:
-        """Render log content into the RichLog widget (runs on the UI thread)."""
+    def _apply_stream_error(self, which: str, path: str, msg: str) -> None:
         if not self.is_attached:
             return
         self._current_path = path
+        self._buffers[which] = []
+        self._offsets[which] = 0
+        self._sync_header(which, path)
+        log = self.query_one("#log-content", RichLog)
+        log.clear()
+        log.write(Text(msg, style="dim italic"))
+        self.query_one("#log-match-lbl", Label).update("")
+
+    def _apply_stream_lines(self, which: str, path: str, lines: list[str],
+                            offset: int, reset: bool) -> None:
+        if not self.is_attached:
+            return
+        self._current_path = path
+        self._offsets[which] = offset
+        if reset:
+            self._buffers[which] = list(lines)
+        elif lines:
+            self._buffers[which].extend(lines)
+        # Bound memory on a job that logs forever.
+        if len(self._buffers[which]) > self.MAX_BUFFER_LINES:
+            del self._buffers[which][:-self.MAX_BUFFER_LINES]
+        self._sync_header(which, path)
+        if reset or lines:
+            self._refresh_view()
+
+    def _sync_header(self, which: str, path: str) -> None:
         self.query_one("#btn-show-stdout", Button).set_class(which == "stdout", "active-log")
         self.query_one("#btn-show-stderr", Button).set_class(which == "stderr", "active-log")
         self.query_one("#path-label", Label).update(f"  {path}")
+
+    def _matcher(self):
+        """Predicate for the current filter.
+
+        A term wrapped in slashes is treated as a regular expression; anything
+        else is a case-insensitive substring. An invalid regex falls back to a
+        substring match rather than erroring while the user is mid-keystroke.
+        """
+        term = (self._filter or "").strip()
+        if not term:
+            return None
+        if len(term) > 2 and term.startswith("/") and term.endswith("/"):
+            inner = term[1:-1]
+            try:
+                rx = re.compile(inner, re.IGNORECASE)
+                return lambda line: bool(rx.search(line))
+            except re.error:
+                # Half-typed pattern: match the text the user meant, not the
+                # delimiters they typed around it.
+                term = inner
+        low = term.lower()
+        return lambda line: low in line.lower()
+
+    def _refresh_view(self) -> None:
+        """Redraw the visible stream, honouring the filter and errors toggle."""
+        if not self.is_attached:
+            return
         log = self.query_one("#log-content", RichLog)
         log.clear()
-        if not content.strip() or content.startswith("("):
-            log.write(Text(content, style="dim italic"))
+        buf = self._buffers.get(self._showing, [])
+        if not buf:
+            log.write(Text("(File is empty)", style="dim italic"))
+            self.query_one("#log-match-lbl", Label).update("")
             return
-        for line in content.splitlines():
+
+        match = self._matcher()
+        shown = 0
+        for line in buf:
             if not line:
                 continue
-            lower = line.lower()
-            if any(k in lower for k in ("error", "exception", "traceback", "fatal", "oom")):
-                log.write(Text(line, style="bold red"))
-            elif any(k in lower for k in ("warning", "warn")):
-                log.write(Text(line, style="yellow"))
-            elif any(k in lower for k in ("success", "done", "finished", "completed")):
-                log.write(Text(line, style="bold green"))
-            else:
-                log.write(Text(line, style="#c9d1d9"))
+            style = self.line_style(line)
+            if self._errors_only and style not in ("bold red", "yellow"):
+                continue
+            if match and not match(line):
+                continue
+            log.write(Text(line, style=style))
+            shown += 1
+
+        label = self.query_one("#log-match-lbl", Label)
+        if match or self._errors_only:
+            label.update(f"  {shown} / {len(buf)} lines")
+            if shown == 0:
+                log.write(Text("(no matching lines)", style="dim italic"))
+        else:
+            label.update(f"  {len(buf)} lines")
         log.scroll_end(animate=False)
 
 # ──────────────────────────────────────────────
@@ -2342,8 +3808,10 @@ class HistoryStatsPanel(Static):
         align: left middle; padding: 0 2;
     }
     #stats-toolbar-label { color: #58a6ff; text-style: bold; margin-right: 2; }
-    #btn-stats-refresh { background: #21262d; color: #c9d1d9; border: none; min-width: 20; }
+    #btn-stats-refresh { background: #21262d; color: #c9d1d9; border: none; min-width: 18; margin-right: 1; }
     #btn-stats-refresh:hover { background: #1f6feb; color: white; }
+    #btn-stats-efficiency { background: #21262d; color: #c9d1d9; border: none; min-width: 22; }
+    #btn-stats-efficiency:hover { background: #9e6a03; color: white; }
     #stats-content {
         height: 1fr; border: none;
     }
@@ -2352,13 +3820,16 @@ class HistoryStatsPanel(Static):
     def compose(self) -> ComposeResult:
         with Horizontal(id="stats-toolbar"):
             yield Label("📊  History analysis",        id="stats-toolbar-label")
-            yield Button("↻  Recalculate",                   id="btn-stats-refresh")
+            yield Button("↻  Recalculate",             id="btn-stats-refresh")
+            yield Button("⚡  Efficiency report",       id="btn-stats-efficiency")
         yield RichLog(id="stats-content", highlight=False, markup=False,
                       wrap=True, max_lines=5000)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-stats-refresh":
             self.app.refresh_stats()
+        elif event.button.id == "btn-stats-efficiency":
+            self.app.refresh_efficiency()
 
     def on_key(self, event) -> None:
         log = self.query_one("#stats-content", RichLog)
@@ -2368,6 +3839,67 @@ class HistoryStatsPanel(Static):
         elif event.key == "pagedown": log.scroll_relative(y=20)
         elif event.key == "home":     log.scroll_home()
         elif event.key == "end":      log.scroll_end(animate=False)
+
+    def render_efficiency(self, records: dict, names: dict) -> None:
+        log = self.query_one("#stats-content", RichLog)
+        log.clear()
+
+        def line(text: str = "", style: str = "white") -> None:
+            log.write(Text(text, style=style))
+
+        def sep(title: str = "") -> None:
+            bar = "─" * max(0, 62 - len(title))
+            line(f"── {title} {bar}" if title else "─" * 66,
+                 "bold #30363d" if title else "#21262d")
+
+        agg = aggregate_efficiency(records)
+        if not agg:
+            line("  No accounting data available for your finished jobs.", "dim")
+            line("  sacct must be configured on the cluster for this report.", "dim")
+            return
+
+        sep("EFFICIENCY — LAST %d FINISHED JOBS" % agg["jobs"])
+        for label, value in (("CPU efficiency", agg["mean_cpu_eff"]),
+                             ("Memory efficiency", agg["mean_mem_eff"])):
+            if value is None:
+                line(f"  Mean {label:<18}: n/a", "dim")
+            else:
+                line(f"  Mean {label:<18}: [{make_bar(int(value), 28)}] {value:>5.1f}%",
+                     bar_color(100 - int(value)))
+        line("")
+        line(f"  Core-hours consumed   : {agg['core_hours']:.1f} h", "#79c0ff")
+        line(f"  Core-hours wasted     : {agg['wasted_core_hours']:.1f} h"
+             f"  ({agg['wasted_core_hours']/agg['core_hours']*100:.0f}% of the total)"
+             if agg["core_hours"] else
+             f"  Core-hours wasted     : {agg['wasted_core_hours']:.1f} h",
+             "bold red" if agg["wasted_core_hours"] > agg["core_hours"] * 0.4 else "yellow")
+        if agg["gpu_hours"]:
+            line(f"  GPU-hours consumed    : {agg['gpu_hours']:.1f} h", "bold #f0883e")
+        line(f"  RAM reserved          : {agg['gb_hours_reserved']:.0f} GB·h", "#79c0ff")
+        line(f"  RAM actually used     : {agg['gb_hours_used']:.0f} GB·h", "#79c0ff")
+
+        sep("CPU EFFICIENCY DISTRIBUTION")
+        total = sum(agg["buckets"].values()) or 1
+        colours = {"0-25%": "bold red", "25-50%": "yellow",
+                   "50-75%": "cyan", "75-100%": "bold green"}
+        for bucket, count in agg["buckets"].items():
+            width = int(30 * count / total)
+            line(f"  {bucket:<9} [{'█' * width}{'░' * (30 - width)}] {count:>4} jobs",
+                 colours[bucket])
+
+        sep("BIGGEST WASTE — REVIEW THESE REQUESTS")
+        line(f"  {'JOBID':<12}{'NAME':<22}{'CPU%':>6}{'MEM%':>7}{'WASTED':>10}", "bold #58a6ff")
+        for rec in agg["worst"]:
+            wasted = rec.get("cpu_hours", 0.0) * max(0.0, 1 - (rec.get("cpu_eff") or 0) / 100)
+            if wasted <= 0:
+                continue
+            cpu = f"{rec['cpu_eff']:.0f}" if rec.get("cpu_eff") is not None else "-"
+            mem = f"{rec['mem_eff']:.0f}" if rec.get("mem_eff") is not None else "-"
+            name = (names.get(rec["jobid"], "") or "")[:20]
+            line(f"  {rec['jobid']:<12}{name:<22}{cpu:>6}{mem:>7}{wasted:>9.1f}h",
+                 efficiency_verdict(rec)[1])
+        sep()
+        line("  Press ↻ Recalculate for the history summary.", "dim")
 
     def render_stats(self, stats: dict, error_patterns: list | None = None) -> None:
         log = self.query_one("#stats-content", RichLog)
@@ -2490,12 +4022,18 @@ class SlurmDashboard(App):
     #jobs-toolbar-lbl { color: #58a6ff; text-style: bold; margin-right: 2; }
     #jobs-info-panel { height: 1fr; padding: 0; }
     #jobs-info-log   { height: 1fr; border: none; background: #0d1117; }
-    #btn-jobs-new       { background: #238636; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-jobs-array     { background: #9e6a03; color: white; border: none; min-width: 20; margin-right: 1; }
-    #btn-jobs-deps      { background: #6e40c9; color: white; border: none; min-width: 18; margin-right: 1; }
+    #btn-jobs-new       { background: #238636; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-jobs-array     { background: #9e6a03; color: white; border: none; min-width: 13; margin-right: 1; }
+    #btn-jobs-deps      { background: #6e40c9; color: white; border: none; min-width: 12; margin-right: 1; }
+    #btn-jobs-eff       { background: #1f6feb; color: white; border: none; min-width: 18; margin-right: 1; }
+    #btn-jobs-why       { background: #8957e5; color: white; border: none; min-width: 19; margin-right: 1; }
+    #btn-jobs-bulk      { background: #da3633; color: white; border: none; min-width: 19; }
     #btn-jobs-new:hover       { background: #2ea043; }
     #btn-jobs-array:hover     { background: #d29922; }
     #btn-jobs-deps:hover      { background: #8957e5; }
+    #btn-jobs-eff:hover       { background: #388bfd; }
+    #btn-jobs-why:hover       { background: #a371f7; }
+    #btn-jobs-bulk:hover      { background: #f85149; }
 
     Button:focus      { border: tall #58a6ff; }
     Button.active-log { border: tall #3fb950; text-style: bold; }
@@ -2564,6 +4102,9 @@ class SlurmDashboard(App):
         ("n", "new_job",        "New job"),
         ("a", "array_expand",   "Array"),
         ("e", "dep_tree",       "Deps"),
+        ("f", "job_efficiency", "Efficiency"),
+        ("w", "why_pending",    "Why pending"),
+        ("k", "bulk_cancel",    "Bulk cancel"),
     ]
 
     TITLE = "SLURM Dashboard"
@@ -2621,9 +4162,12 @@ class SlurmDashboard(App):
             with Vertical(id="jobs-panel"):
                 with Horizontal(id="jobs-toolbar"):
                     yield Label("🚀  Job management", id="jobs-toolbar-lbl")
-                    yield Button("▶  New job [n]",            id="btn-jobs-new")
-                    yield Button("⣿  Array expand [a]",      id="btn-jobs-array")
-                    yield Button("🔗  Dependencies [e]",     id="btn-jobs-deps")
+                    yield Button("▶  New job [n]",          id="btn-jobs-new")
+                    yield Button("⣿  Array [a]",            id="btn-jobs-array")
+                    yield Button("🔗  Deps [e]",             id="btn-jobs-deps")
+                    yield Button("⚡  Efficiency [f]",       id="btn-jobs-eff")
+                    yield Button("⏳  Why pending [w]",      id="btn-jobs-why")
+                    yield Button("⚠  Bulk cancel [k]",      id="btn-jobs-bulk")
                 with Vertical(id="jobs-info-panel"):
                     yield RichLog(id="jobs-info-log", highlight=False,
                                   markup=False, wrap=True, max_lines=2000)
@@ -2731,6 +4275,9 @@ class SlurmDashboard(App):
             "btn-jobs-new":       self.action_new_job,
             "btn-jobs-array":     self.action_array_expand,
             "btn-jobs-deps":      self.action_dep_tree,
+            "btn-jobs-eff":       self.action_job_efficiency,
+            "btn-jobs-why":       self.action_why_pending,
+            "btn-jobs-bulk":      self.action_bulk_cancel,
         }
         handler = actions.get(bid)
         if handler is not None:
@@ -3213,6 +4760,7 @@ class SlurmDashboard(App):
     def _apply_resolve_gone(self, updates: list[tuple]) -> None:
         log = self.query_one(EventLog)
         changed = False
+        finished: list[tuple[str, str, str]] = []
         for jid, real_state, now in updates:
             entry = next((e for e in self._history if e.get("jobid") == jid), None)
             if entry:
@@ -3220,17 +4768,68 @@ class SlurmDashboard(App):
                 entry["state"]     = real_state
                 entry["last_seen"] = now
                 changed = True
+                if entry.get("user", MY_USER) == MY_USER:
+                    finished.append((jid, real_state, entry.get("name", "")))
             else:
                 old_state = "?"
             col = state_style(real_state)
             log.log_event(f"Job {jid}: {old_state} → {real_state} (sacct)", col)
+        if finished:
+            self._announce_finished(finished)
         if changed:
             save_history(self._history)
             # Always refresh so data is correct whenever user switches to History
             self._refresh_history_table()
 
+    # ── completion notifications ───────────────────────────────────────
+    def _announce_finished(self, finished: list[tuple[str, str, str]]) -> None:
+        """Toast, bell and user hook when one of your jobs reaches its end."""
+        cfg = CONFIG["notifications"]
+        if cfg["notify_on_finish"]:
+            for jid, state, name in finished[:5]:
+                severity = ("information" if state == "COMPLETED"
+                            else "warning" if state in ("CANCELLED", "PREEMPTED")
+                            else "error")
+                label = f" ({name})" if name else ""
+                self.notify(f"Job {jid}{label} finished: {state}",
+                            severity=severity, timeout=10)
+            if len(finished) > 5:
+                self.notify(f"…and {len(finished) - 5} more jobs finished", timeout=6)
+        if cfg["bell_on_finish"]:
+            try:
+                self.bell()
+            except Exception:
+                pass
+        if cfg["hook"]:
+            self._worker_run_hooks(finished)
+
+    @work(thread=True)
+    def _worker_run_hooks(self, finished: list[tuple[str, str, str]]) -> None:
+        hook = CONFIG["notifications"]["hook"]
+        for jid, state, name in finished:
+            run_completion_hook(hook, jid, state, name)
+
     def refresh_stats(self) -> None:
         self._worker_stats()
+
+    def refresh_efficiency(self) -> None:
+        self.notify("Querying sacct for efficiency data…", timeout=4)
+        self._worker_efficiency()
+
+    @work(thread=True, exclusive=True, group="efficiency")
+    def _worker_efficiency(self) -> None:
+        done = [e for e in self._history
+                if (e.get("state") or "").upper() in TERMINAL_STATES]
+        recent = done[-150:]
+        names = {e["jobid"]: e.get("name", "") for e in recent}
+        data = get_job_efficiency([e["jobid"] for e in recent])
+        self.app.call_from_thread(self._apply_efficiency, data, names)
+
+    def _apply_efficiency(self, data: dict, names: dict) -> None:
+        try:
+            self.query_one(HistoryStatsPanel).render_efficiency(data, names)
+        except Exception:
+            pass
 
     @work(thread=True)
     def _worker_stats(self) -> None:
@@ -3268,15 +4867,113 @@ class SlurmDashboard(App):
             return
         self.push_screen(DependencyTreeModal(jobid), lambda _: None)
 
+    # ── efficiency ─────────────────────────────────────────────────────
+    def action_job_efficiency(self) -> None:
+        jobid = self._get_selected_jobid()
+        if not jobid:
+            self.notify("Select a job first", severity="warning", timeout=3)
+            return
+        job = self._jobs_by_id.get(jobid, {})
+        entry = next((e for e in self._history if e.get("jobid") == jobid), {})
+        name = job.get("name") or entry.get("name", "")
+        self.push_screen(EfficiencyModal(jobid, job_name=name), lambda _: None)
+
+    # ── why is this job pending ────────────────────────────────────────
+    def action_why_pending(self) -> None:
+        jobid = self._get_selected_jobid()
+        if not jobid:
+            self.notify("Select a job first", severity="warning", timeout=3)
+            return
+        job = self._jobs_by_id.get(jobid)
+        if not job:
+            self.notify(f"Job {jobid} is not in the queue any more — "
+                        "press F for its efficiency report instead",
+                        severity="warning", timeout=5)
+            return
+        state = job.get("state", "")
+        if state not in ("PD", "PENDING"):
+            self.notify(f"Job {jobid} is {state}, not pending", severity="warning",
+                        timeout=4)
+            return
+        self.push_screen(
+            PriorityModal(jobid, reason=job.get("reason", ""),
+                          partition=job.get("partition", ""), state=state),
+            lambda _: None)
+
+    # ── bulk cancel ────────────────────────────────────────────────────
+    def action_bulk_cancel(self) -> None:
+        self.push_screen(
+            TextPromptModal(
+                "⚠  Bulk cancel — which of your jobs?",
+                "pending | running | all | text matching the job name",
+                "pending"),
+            callback=self._bulk_collect)
+
+    def _bulk_collect(self, selector: str | None) -> None:
+        if not selector:
+            return
+        sel = selector.strip().lower()
+        mine = [j for j in self._jobs_by_id.values() if j.get("user") == MY_USER]
+        if sel in ("pending", "pd"):
+            jobs, desc = [j for j in mine if j["state"] in ("PD", "PENDING")], "your pending jobs"
+        elif sel in ("running", "r"):
+            jobs, desc = [j for j in mine if j["state"] in ("R", "RUNNING")], "your running jobs"
+        elif sel == "all":
+            jobs, desc = mine, "all your jobs"
+        else:
+            jobs = [j for j in mine if sel in j.get("name", "").lower()]
+            desc = f"your jobs matching '{selector.strip()}'"
+        jobs = [j for j in jobs if is_valid_jobid(j.get("jobid", ""))]
+        if not jobs:
+            self.notify(f"No jobs matched {desc}", severity="warning", timeout=4)
+            return
+        self.push_screen(BulkCancelModal(jobs, desc), callback=self._bulk_cancel_confirmed)
+
+    def _bulk_cancel_confirmed(self, jobids: list | None) -> None:
+        if not jobids:
+            return
+        self.notify(f"Cancelling {len(jobids)} job(s)…", timeout=3)
+        self._worker_bulk_cancel(list(jobids))
+
+    @work(thread=True)
+    def _worker_bulk_cancel(self, jobids: list[str]) -> None:
+        ids = [j for j in jobids if is_valid_jobid(j)]
+        errors: list[str] = []
+        done = 0
+        # scancel takes several ids at once; chunked so the argv stays sane.
+        for i in range(0, len(ids), 100):
+            batch = ids[i:i + 100]
+            _, err = run(["scancel"] + batch, timeout=30)
+            if err.strip():
+                errors.append(err.strip())
+            else:
+                done += len(batch)
+        self.app.call_from_thread(self._bulk_cancel_done, done, len(ids), errors)
+
+    def _bulk_cancel_done(self, done: int, total: int, errors: list[str]) -> None:
+        log = self.query_one(EventLog)
+        if errors:
+            self.notify(f"Cancelled {done}/{total}; errors: {errors[0][:120]}",
+                        severity="error", timeout=8)
+            log.log_event(f"bulk scancel {done}/{total} — {errors[0][:80]}", "bold red")
+        else:
+            self.notify(f"Cancelled {done} job(s)", severity="information", timeout=5)
+            log.log_event(f"bulk scancel {done} job(s) by {MY_USER}", "bold yellow")
+        self.refresh_data()
+
     def _render_jobs_panel(self) -> None:
         log = self.query_one("#jobs-info-log", RichLog)
         log.clear()
         log.write(Text("── Keyboard shortcuts "
                        + "─" * 45, style="bold #30363d"))
         shortcuts = [
-            ("N", "New job — open sbatch form with all fields"),
-            ("A", "Array expand — expand the selected array job into tasks"),
-            ("E", "Dependencies — show the dependency tree for the selected job"),
+            ("N", "New job — sbatch form, with save/load of templates"),
+            ("A", "Array expand — per-task states, and rerun only the failed ones"),
+            ("E", "Dependencies — dependency tree for the selected job"),
+            ("F", "Efficiency — what the job reserved versus what it used"),
+            ("W", "Why pending — blocking reason, queue position, priority"),
+            ("K", "Bulk cancel — cancel many of your jobs behind a typed confirm"),
+            ("/", "Inside the log viewer: filter lines (text or /regex/)"),
         ]
         for key, desc in shortcuts:
             line = Text(f"  [{key}]  ", style="bold yellow")
@@ -3286,12 +4983,21 @@ class SlurmDashboard(App):
         log.write(Text("── Workflow "
                        + "─" * 55, style="bold #30363d"))
         tips = [
-            "1. Press N  →  fill the sbatch form  →  submit your job",
-            "2. Select an array job in All Jobs  →  A to see individual tasks",
-            "3. Select any job  →  E to see its dependency tree",
+            "1. Press N  →  fill the sbatch form  →  save it as a template for next time",
+            "2. Select an array job  →  A  →  rerun just the failed tasks",
+            "3. A job stuck in PENDING?  →  W tells you what is blocking it",
+            "4. After a job finishes  →  F shows whether the request was oversized",
+            "5. Stats tab  →  ⚡ Efficiency report aggregates that across your history",
         ]
         for tip in tips:
             log.write(Text(f"  {tip}", style="#8b949e"))
+        log.write(Text(""))
+        log.write(Text("── Configuration " + "─" * 50, style="bold #30363d"))
+        log.write(Text(f"  {CONFIG_FILE}", style="#8b949e"))
+        log.write(Text(f"  templates: {TEMPLATE_FILE}", style="#8b949e"))
+        log.write(Text(f"  ssh to compute nodes: "
+                       f"{'enabled' if CONFIG['monitor']['use_ssh'] else 'disabled'}",
+                       style="#8b949e"))
 
 
     def action_manual_refresh(self) -> None:
@@ -3342,11 +5048,50 @@ def _fix_stdin_blocking() -> None:
         pass  # stdin is not a real fd (e.g. redirected) — ignore
 
 
-if __name__ == "__main__":
+USAGE = """\
+slurm_dashboard — terminal dashboard for Slurm
+
+  sqdash                 launch the dashboard
+  sqdash --write-config  create the config file with documented defaults
+  sqdash --show-config   print the effective configuration and exit
+  sqdash --help          this message
+
+Config: {config}
+Templates: {templates}
+"""
+
+
+def _main() -> None:
+    args = sys.argv[1:]
+    if "--help" in args or "-h" in args:
+        print(USAGE.format(config=CONFIG_FILE, templates=TEMPLATE_FILE))
+        return
+    if "--write-config" in args:
+        path = write_default_config()
+        print(f"Config written to {path}")
+        return
+    if "--show-config" in args:
+        print(f"# effective configuration (from {CONFIG_FILE})")
+        for section, values in CONFIG.items():
+            print(f"\n[{section}]")
+            for key, value in values.items():
+                print(f"{key} = {value}")
+        return
+    if args:
+        print(f"Unknown option: {args[0]}\n")
+        print(USAGE.format(config=CONFIG_FILE, templates=TEMPLATE_FILE))
+        sys.exit(2)
+
     if not shutil.which("squeue"):
         print("Error: Slurm is not available in your $PATH.")
         print("Make sure to run 'module load slurm' (or equivalent) before launching the dashboard.")
         sys.exit(1)
+    # Make the config discoverable on first run instead of documenting a
+    # file that does not exist yet.
+    try:
+        write_default_config()
+    except Exception:
+        pass
     _fix_stdin_blocking()
     app = SlurmDashboard()
     app.run()
@@ -3355,3 +5100,7 @@ if __name__ == "__main__":
     if req:
         binary, path = req
         _exec_editor(binary, path)
+
+
+if __name__ == "__main__":
+    _main()
