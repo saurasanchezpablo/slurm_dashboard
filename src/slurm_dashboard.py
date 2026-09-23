@@ -28,6 +28,122 @@ from textual.screen import ModalScreen
 from textual import work
 from textual.timer import Timer
 from rich.text import Text
+from textual.theme import Theme
+
+# ──────────────────────────────────────────────
+#  DESIGN TOKENS
+# ──────────────────────────────────────────────
+#  One table drives everything: the Textual theme used by the stylesheets
+#  ($sq-* variables) and the constants used by Rich when painting table
+#  cells and log lines.  Nothing in this file should name a colour that is
+#  not in here — tests/test_theme.py enforces that.
+#
+#  The ramp is a cool graphite with a single azure accent; hue is reserved
+#  for meaning (job state, thresholds), never for decoration.
+PALETTE = {
+    # ── surfaces, darkest to lightest ──
+    "bg":          "#0f1319",   # app canvas
+    "surface":     "#161b23",   # tables, log bodies, inputs
+    "surface_alt": "#1a2029",   # alternating table rows
+    "panel":       "#1c222c",   # toolbars, headers, footers, dialogs
+    "elevated":    "#242b36",   # buttons, hover states
+    "line":        "#29313c",   # hairlines and default borders
+    "line_strong": "#3a4553",   # dividers that must read as structure
+
+    # ── type ──
+    "fg":        "#dbe2ea",     # primary text
+    "fg_muted":  "#93a0b0",     # secondary text, labels
+    "fg_faint":  "#6a7583",     # captions, timestamps, rules
+    "fg_dim":    "#4a5462",     # disabled
+
+    # ── accent: focus, selection, primary action ──
+    "primary":       "#4d8dfb",
+    "primary_hover": "#6fa3ff",
+    "primary_soft":  "#8fb8ff",
+
+    # ── semantic: state and thresholds only ──
+    "ok":          "#46b96a",
+    "ok_hover":    "#57cc7c",
+    "info":        "#3fb6c9",
+    "warn":        "#d8a13c",
+    "warn_hover":  "#e8b153",
+    "err":         "#e2574f",
+    "err_hover":   "#f06a62",
+    "violet":      "#9b78e8",
+    "violet_hover": "#ae8ff2",
+    "amber":       "#dd8a4c",
+}
+
+
+class C:
+    """Palette as attributes, for Rich style strings."""
+    BG          = PALETTE["bg"]
+    SURFACE     = PALETTE["surface"]
+    SURFACE_ALT = PALETTE["surface_alt"]
+    PANEL       = PALETTE["panel"]
+    ELEVATED    = PALETTE["elevated"]
+    LINE        = PALETTE["line"]
+    LINE_STRONG = PALETTE["line_strong"]
+    FG          = PALETTE["fg"]
+    FG_MUTED    = PALETTE["fg_muted"]
+    FG_FAINT    = PALETTE["fg_faint"]
+    FG_DIM      = PALETTE["fg_dim"]
+    PRIMARY     = PALETTE["primary"]
+    PRIMARY_SOFT = PALETTE["primary_soft"]
+    OK          = PALETTE["ok"]
+    INFO        = PALETTE["info"]
+    WARN        = PALETTE["warn"]
+    ERR         = PALETTE["err"]
+    VIOLET      = PALETTE["violet"]
+    AMBER       = PALETTE["amber"]
+
+
+def build_theme() -> Theme:
+    """Expose the palette to the stylesheets as $sq-* variables.
+
+    The sq- prefix keeps these clear of Textual's own variables, so a future
+    Textual release cannot silently redefine one of ours.
+    """
+    return Theme(
+        name="sqdash",
+        dark=True,
+        primary=PALETTE["primary"],
+        secondary=PALETTE["violet"],
+        accent=PALETTE["primary"],
+        success=PALETTE["ok"],
+        warning=PALETTE["warn"],
+        error=PALETTE["err"],
+        background=PALETTE["bg"],
+        surface=PALETTE["surface"],
+        panel=PALETTE["panel"],
+        foreground=PALETTE["fg"],
+        variables={
+            "sq-bg":           PALETTE["bg"],
+            "sq-surface":      PALETTE["surface"],
+            "sq-surface-alt":  PALETTE["surface_alt"],
+            "sq-panel":        PALETTE["panel"],
+            "sq-elevated":     PALETTE["elevated"],
+            "sq-line":         PALETTE["line"],
+            "sq-line-strong":  PALETTE["line_strong"],
+            "sq-fg":           PALETTE["fg"],
+            "sq-fg-muted":     PALETTE["fg_muted"],
+            "sq-fg-faint":     PALETTE["fg_faint"],
+            "sq-fg-dim":       PALETTE["fg_dim"],
+            "sq-primary":      PALETTE["primary"],
+            "sq-primary-hover": PALETTE["primary_hover"],
+            "sq-ok":           PALETTE["ok"],
+            "sq-ok-hover":     PALETTE["ok_hover"],
+            "sq-info":         PALETTE["info"],
+            "sq-warn":         PALETTE["warn"],
+            "sq-warn-hover":   PALETTE["warn_hover"],
+            "sq-err":          PALETTE["err"],
+            "sq-err-hover":    PALETTE["err_hover"],
+            "sq-violet":       PALETTE["violet"],
+            "sq-violet-hover": PALETTE["violet_hover"],
+            "sq-amber":        PALETTE["amber"],
+        },
+    )
+
 
 # ──────────────────────────────────────────────
 #  CONFIG
@@ -326,16 +442,20 @@ def run_out(cmd: list[str]) -> str:
     return run(cmd)[0]
 
 def state_style(state: str) -> str:
+    """Rich style for a job state. Hue means state and nothing else."""
     return {
-        "R": "bold green",   "RUNNING": "bold green",
-        "PD": "bold cyan",   "PENDING": "bold cyan",
-        "CG": "green",       "COMPLETING": "green",
-        "CD": "dim",         "COMPLETED": "dim",
-        "F":  "bold red",    "FAILED": "bold red",
-        "CA": "red",         "CANCELLED": "red",
-        "TO": "yellow",      "TIMEOUT": "yellow",
-        "OOM": "bold red",
-    }.get(state.upper().strip(), "white")
+        "R":   f"bold {C.OK}",     "RUNNING":    f"bold {C.OK}",
+        "PD":  f"bold {C.INFO}",   "PENDING":    f"bold {C.INFO}",
+        "CG":  C.OK,               "COMPLETING": C.OK,
+        "CD":  C.FG_MUTED,         "COMPLETED":  C.FG_MUTED,
+        "F":   f"bold {C.ERR}",    "FAILED":     f"bold {C.ERR}",
+        "CA":  C.WARN,             "CANCELLED":  C.WARN,
+        "TO":  f"bold {C.WARN}",   "TIMEOUT":    f"bold {C.WARN}",
+        "NF":  f"bold {C.ERR}",    "NODE_FAIL":  f"bold {C.ERR}",
+        "PR":  C.VIOLET,           "PREEMPTED":  C.VIOLET,
+        "S":   C.FG_FAINT,         "SUSPENDED":  C.FG_FAINT,
+        "OOM": f"bold {C.ERR}",    "OUT_OF_MEMORY": f"bold {C.ERR}",
+    }.get(state.upper().strip(), C.FG)
 
 def sacct_final_state(jobids: list[str]) -> dict[str, str]:
     """
@@ -424,7 +544,10 @@ def parse_squeue() -> list[dict]:
             "cpus":      parts[6],
             "mem":       parts[7],
             "gpus":      gpu_val,
-            "reason":    parts[9] if parts[9] != "None" else "",
+            # %R carries the pending reason for queued jobs and the node
+            # list for running ones — showing the latter just repeats the
+            # NODES column, so it is dropped.
+            "reason":    "" if parts[9] in ("None", parts[10]) else parts[9],
             "nodes":     parts[10],
             "name":      parts[11][:20],
             "est_start": "",          # filled in by refresh_data()
@@ -489,10 +612,8 @@ def _format_start_time(raw: str, now: datetime, today) -> str:
         return f"~{delta_mins}m"              # "~34m"
     if dt.date() == today:
         return dt.strftime("today %H:%M")     # "today 18:45"
-    if (dt.date() - today).days == 1:
-        return dt.strftime("tmrw  %H:%M")     # "tmrw  09:00"
     if (dt.date() - today).days < 7:
-        return dt.strftime("%a   %H:%M")      # "Wed   14:30"
+        return dt.strftime("%a %H:%M")        # "Wed 14:30"
     return dt.strftime("%b %-d")              # "Jul  3"
 
 def parse_sinfo() -> list[dict]:
@@ -794,9 +915,10 @@ def make_bar(pct: int, width: int = 20, fill: str = "█", empty: str = "░") -
     return fill * filled + empty * (width - filled)
 
 def bar_color(pct: int) -> str:
-    if pct >= 90: return "bold red"
-    if pct >= 70: return "yellow"
-    return "bold green"
+    """Threshold colour for a utilisation bar."""
+    if pct >= 90: return f"bold {C.ERR}"
+    if pct >= 70: return C.WARN
+    return C.OK
 
 # ──────────────────────────────────────────────
 #  JOB RERUN / RESUBMIT
@@ -1761,16 +1883,16 @@ def reservation_status(res: dict, now=None):
     start = parse_slurm_datetime(res.get("start_time", ""))
     end = parse_slurm_datetime(res.get("end_time", ""))
     if start and now < start:
-        return (f"starts in {humanize_delta((start - now).total_seconds())}", "cyan")
+        return (f"starts in {humanize_delta((start - now).total_seconds())}", C.INFO)
     if start and end and start <= now <= end:
         return (f"active, {humanize_delta((end - now).total_seconds())} left",
                 "bold green")
     if end and now > end:
-        return ("ended", "dim")
+        return ("ended", C.FG_FAINT)
     state = (res.get("state") or "").upper()
     if state == "ACTIVE":
-        return ("active", "bold green")
-    return (state.lower() or "unknown", "white")
+        return ("active", f"bold {C.OK}")
+    return (state.lower() or "unknown", C.FG)
 
 
 def reservation_blocks_jobs(res: dict) -> bool:
@@ -2037,28 +2159,28 @@ class SubmitJobModal(ModalScreen):
     SubmitJobModal { align: center middle; }
     #submit-dialog {
         width: 90%; max-width: 88; height: 90%; max-height: 40;
-        background: #161b22; border: solid #30363d;
+        background: $sq-panel; border: solid $sq-line;
         padding: 1 2; layout: vertical;
     }
     /* The form outgrew a short terminal once ntasks was added, so the
        fields scroll while the buttons stay pinned to the bottom. */
     #submit-fields { height: 1fr; }
-    #submit-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
-    #partition-hint { color: #6e7681; height: auto; }
+    #submit-title { color: $sq-primary; text-style: bold; margin-bottom: 1; }
+    #partition-hint { color: $sq-fg-faint; height: auto; }
     .field-row { height: 3; layout: horizontal; margin-bottom: 0; }
-    .field-lbl { width: 18; color: #8b949e; content-align: right middle; padding-right: 1; }
-    .field-inp { width: 1fr; height: 3; border: solid #30363d; background: #0d1117; color: #c9d1d9; }
-    .field-inp:focus { border: solid #58a6ff; }
+    .field-lbl { width: 18; color: $sq-fg-muted; content-align: right middle; padding-right: 1; }
+    .field-inp { width: 1fr; height: 3; border: solid $sq-line; background: $sq-bg; color: $sq-fg; }
+    .field-inp:focus { border: solid $sq-primary; }
     #submit-btn-row { height: 3; layout: horizontal; margin-top: 1; }
-    #btn-submit-run    { background: #238636; color: white; border: none; min-width: 16; margin-right: 1; }
-    #btn-submit-save   { background: #1f6feb; color: white; border: none; min-width: 16; margin-right: 1; }
-    #btn-submit-load   { background: #6e40c9; color: white; border: none; min-width: 16; margin-right: 1; }
-    #btn-submit-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 10; }
-    #btn-submit-run:hover    { background: #2ea043; }
-    #btn-submit-save:hover   { background: #388bfd; }
-    #btn-submit-load:hover   { background: #8957e5; }
-    #btn-submit-cancel:hover { background: #30363d; }
-    #submit-status { color: #8b949e; margin-top: 1; }
+    #btn-submit-run    { background: $sq-ok; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-save   { background: $sq-primary; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-load   { background: $sq-violet; color: white; border: none; min-width: 16; margin-right: 1; }
+    #btn-submit-cancel { background: $sq-elevated; color: $sq-fg; border: none; min-width: 10; }
+    #btn-submit-run:hover    { background: $sq-ok-hover; }
+    #btn-submit-save:hover   { background: $sq-primary-hover; }
+    #btn-submit-load:hover   { background: $sq-violet; }
+    #btn-submit-cancel:hover { background: $sq-line; }
+    #submit-status { color: $sq-fg-muted; margin-top: 1; }
     """
 
     def __init__(self, initial: dict | None = None):
@@ -2075,7 +2197,7 @@ class SubmitJobModal(ModalScreen):
     def compose(self) -> ComposeResult:
         v = self._initial
         with Vertical(id="submit-dialog"):
-            yield Label("🚀  Submit new job (sbatch)", id="submit-title")
+            yield Label("Submit new job — sbatch", id="submit-title")
             with VerticalScroll(id="submit-fields"):
                 yield from self._field("Script (.sh):",  "script",    "/path/to/job.sh", v.get("script", ""))
                 yield from self._field("Job name:",      "job_name",  "my_job",          v.get("job_name", ""))
@@ -2092,10 +2214,10 @@ class SubmitJobModal(ModalScreen):
                 yield from self._field("Args extra:",    "extra",     "--exclusive",     v.get("extra", ""))
             yield Label("", id="partition-hint")
             with Horizontal(id="submit-btn-row"):
-                yield Button("▶  Submit",       id="btn-submit-run")
-                yield Button("💾  Save tpl",     id="btn-submit-save")
-                yield Button("📑  Load tpl",     id="btn-submit-load")
-                yield Button("✕  Close",        id="btn-submit-cancel")
+                yield Button("Submit",           id="btn-submit-run")
+                yield Button("Save template",    id="btn-submit-save")
+                yield Button("Load template",    id="btn-submit-load")
+                yield Button("Close  Esc",       id="btn-submit-cancel")
             yield Label("", id="submit-status")
 
     def on_mount(self) -> None:
@@ -2136,7 +2258,7 @@ class SubmitJobModal(ModalScreen):
         p = self._partitions.get(chosen)
         if not p:
             close = [n for n in self._partitions if n.startswith(chosen)]
-            hint.update(f"  [yellow]Unknown partition '{chosen}'[/]"
+            hint.update(f"  [{C.WARN}]Unknown partition '{chosen}'[/]"
                         + (f" — did you mean {', '.join(close[:4])}?" if close else ""))
             return
         bits = [f"MaxTime {p['max_time']}"]
@@ -2144,7 +2266,7 @@ class SubmitJobModal(ModalScreen):
         if p["def_mem_per_cpu"]:  bits.append(f"DefMem/CPU {p['def_mem_per_cpu']}M")
         if p["max_mem_per_node"]: bits.append(f"MaxMem/Node {p['max_mem_per_node']}M")
         bits.append(f"State {p['state']}")
-        hint.update(f"  [#58a6ff]{chosen}[/]: " + "  ·  ".join(bits))
+        hint.update(f"  [#4d8dfb]{chosen}[/]: " + "  ·  ".join(bits))
 
     def _get_values(self) -> dict:
         return {f: self.query_one(f"#si-{f}", Input).value.strip()
@@ -2166,10 +2288,10 @@ class SubmitJobModal(ModalScreen):
         elif bid == "btn-submit-save":
             vals = self._get_values()
             if not vals.get("script"):
-                status.update("[bold red]✗ Nothing to save — fill the form first[/]")
+                status.update(f"[bold {C.ERR}]✗ Nothing to save — fill the form first[/]")
                 return
             self.app.push_screen(
-                TextPromptModal("💾  Save template as", "e.g. gpu-training",
+                TextPromptModal("Save template as", "e.g. gpu-training",
                                 vals.get("job_name", "")),
                 callback=lambda name: self._save_template(name, vals))
         elif bid == "btn-submit-load":
@@ -2178,15 +2300,15 @@ class SubmitJobModal(ModalScreen):
         elif bid == "btn-submit-run":
             vals = self._get_values()
             if not vals.get("script"):
-                status.update("[bold red]✗ A script path is required[/]")
+                status.update(f"[bold {C.ERR}]✗ A script path is required[/]")
                 return
             script = os.path.expanduser(vals["script"])
             if not os.path.isfile(script):
-                status.update(f"[bold red]✗ Script not found: {script}[/]")
+                status.update(f"[bold {C.ERR}]✗ Script not found: {script}[/]")
                 return
             # sbatch has a 30 s timeout — running it inline froze the whole
             # TUI until the controller answered.
-            status.update("[dim]Submitting…[/]")
+            status.update(f"[{C.FG_FAINT}]Submitting…[/]")
             event.button.disabled = True
             self._worker_submit(vals)
 
@@ -2197,9 +2319,9 @@ class SubmitJobModal(ModalScreen):
         templates = upsert_template(load_templates(), name, values)
         status = self.query_one("#submit-status", Label)
         if save_templates(templates):
-            status.update(f"[bold green]✓ Template '{name}' saved[/]")
+            status.update(f"[bold {C.OK}]✓ Template '{name}' saved[/]")
         else:
-            status.update(f"[bold red]✗ Could not write {TEMPLATE_FILE}[/]")
+            status.update(f"[bold {C.ERR}]✗ Could not write {TEMPLATE_FILE}[/]")
 
     def _template_chosen(self, result) -> None:
         if not result:
@@ -2208,13 +2330,13 @@ class SubmitJobModal(ModalScreen):
         status = self.query_one("#submit-status", Label)
         if action == "load":
             self._set_values(entry["values"])
-            status.update(f"[bold green]✓ Loaded template '{entry['name']}'[/]")
+            status.update(f"[bold {C.OK}]✓ Loaded template '{entry['name']}'[/]")
         elif action == "delete":
             remaining = [t for t in load_templates() if t["name"] != entry["name"]]
             if save_templates(remaining):
-                status.update(f"[bold yellow]Template '{entry['name']}' deleted[/]")
+                status.update(f"[bold {C.WARN}]Template '{entry['name']}' deleted[/]")
             else:
-                status.update("[bold red]✗ Could not update the template file[/]")
+                status.update(f"[bold {C.ERR}]✗ Could not update the template file[/]")
 
     @work(thread=True)
     def _worker_submit(self, vals: dict) -> None:
@@ -2227,11 +2349,11 @@ class SubmitJobModal(ModalScreen):
         status = self.query_one("#submit-status", Label)
         self.query_one("#btn-submit-run", Button).disabled = False
         if ok:
-            status.update(f"[bold green]✓ Submitted: {msg}[/]")
+            status.update(f"[bold {C.OK}]✓ Submitted: {msg}[/]")
             self.app.notify(f"Job submitted: {msg}", timeout=5)
             self.set_timer(2.0, lambda: self.dismiss(vals))
         else:
-            status.update(f"[bold red]✗ Error: {msg}[/]")
+            status.update(f"[bold {C.ERR}]✗ Error: {msg}[/]")
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -2243,17 +2365,17 @@ class ArrayJobModal(ModalScreen):
     """Shows all tasks of an array job with individual state."""
     DEFAULT_CSS = """
     ArrayJobModal { align: center middle; }
-    #array-dialog { width: 92%; max-width: 96; height: 80%; max-height: 32; background: #161b22;
-                    border: solid #30363d; padding: 1 2; layout: vertical; }
-    #array-title  { color: #f0883e; text-style: bold; margin-bottom: 1; }
+    #array-dialog { width: 92%; max-width: 96; height: 80%; max-height: 32; background: $sq-panel;
+                    border: solid $sq-line; padding: 1 2; layout: vertical; }
+    #array-title  { color: $sq-amber; text-style: bold; margin-bottom: 1; }
     #array-table  { height: 1fr; }
-    #array-summary { color: #8b949e; margin-top: 1; }
+    #array-summary { color: $sq-fg-muted; margin-top: 1; }
     #array-btn-row { height: 3; margin-top: 1; align: left middle; }
-    #btn-array-rerun { background: #1f6feb; color: white; border: none;
+    #btn-array-rerun { background: $sq-primary; color: white; border: none;
                        min-width: 26; margin-right: 1; }
-    #btn-array-rerun:hover { background: #388bfd; }
-    #btn-array-rerun.disabled { background: #21262d; color: #484f58; }
-    #btn-array-close { background: #21262d; color: #c9d1d9; border: none;
+    #btn-array-rerun:hover { background: $sq-primary-hover; }
+    #btn-array-rerun.disabled { background: $sq-elevated; color: $sq-fg-faint; }
+    #btn-array-close { background: $sq-elevated; color: $sq-fg; border: none;
                        min-width: 14; }
     """
 
@@ -2271,8 +2393,8 @@ class ArrayJobModal(ModalScreen):
             yield tbl
             yield Label("", id="array-summary")
             with Horizontal(id="array-btn-row"):
-                yield Button("↻  Rerun failed tasks", id="btn-array-rerun")
-                yield Button("✕  Close  [Esc]", id="btn-array-close")
+                yield Button("Rerun failed tasks", id="btn-array-rerun")
+                yield Button("Close  Esc", id="btn-array-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -2291,15 +2413,15 @@ class ArrayJobModal(ModalScreen):
         self._failed = failed_task_indices(tasks)
         btn = self.query_one("#btn-array-rerun", Button)
         if self._failed:
-            btn.label = f"↻  Rerun {len(self._failed)} failed task(s)"
+            btn.label = f"Rerun {len(self._failed)} failed task(s)"
             btn.set_class(False, "disabled")
         else:
-            btn.label = "↻  No failed tasks"
+            btn.label = "No failed tasks"
             btn.set_class(True, "disabled")
         tbl = self.query_one("#array-table", DataTable)
         if not tasks:
             self.query_one("#array-title", Label).update(
-                f"[yellow]Array job {self._jobid} — no tasks found in sacct[/]")
+                f"[{C.WARN}]Array job {self._jobid} — no tasks found in sacct[/]")
             return
         state_count = {}
         for t in tasks:
@@ -2307,13 +2429,13 @@ class ArrayJobModal(ModalScreen):
             state_count[st] = state_count.get(st, 0) + 1
             style = state_style(st)
             tbl.add_row(
-                Text(t["jobid"],   style="cyan"),
+                Text(t["jobid"],   style=C.INFO),
                 Text(t["name"][:22]),
                 Text(st,           style=style),
-                Text(t["exitcode"],style="red" if t["exitcode"] not in ("0:0","") else "dim"),
-                Text(t["elapsed"], style="white"),
+                Text(t["exitcode"],style=C.ERR if t["exitcode"] not in ("0:0","") else "dim"),
+                Text(t["elapsed"], style=C.FG),
                 Text(t["nodes"][:20]),
-                Text(t["start"][:16], style="dim"),
+                Text(t["start"][:16], style=C.FG_FAINT),
             )
         total = len(tasks)
         ok    = state_count.get("COMPLETED", 0)
@@ -2321,12 +2443,12 @@ class ArrayJobModal(ModalScreen):
         run   = state_count.get("RUNNING", 0)
         pend  = state_count.get("PENDING", 0)
         self.query_one("#array-title", Label).update(
-            f"Array job [bold cyan]{self._jobid}[/] — {total} tasks")
+            f"Array job [bold {C.INFO}]{self._jobid}[/] — {total} tasks")
         self.query_one("#array-summary", Label).update(
-            f"  [green]✓ {ok} COMPLETED[/]  "
-            f"[red]✗ {fail} FAILED/TIMEOUT[/]  "
-            f"[cyan]▶ {run} RUNNING[/]  "
-            f"[white]⏳ {pend} PENDING[/]")
+            f"  [{C.OK}]✓ {ok} COMPLETED[/]  "
+            f"[{C.ERR}]✗ {fail} FAILED/TIMEOUT[/]  "
+            f"[{C.INFO}]▶ {run} RUNNING[/]  "
+            f"[{C.FG}]{pend} PENDING[/]")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-array-close":
@@ -2360,7 +2482,7 @@ class ArrayJobModal(ModalScreen):
             return
         preview = " ".join(shlex.quote(a) for a in args)
         self.app.push_screen(
-            ConfirmModal("↻  Rerun failed array tasks",
+            ConfirmModal("Rerun failed array tasks",
                          f"{len(self._failed)} task(s): "
                          f"{compact_indices(self._failed)}\n\n{preview[:200]}"),
             callback=lambda ok: self._do_rerun(ok, args))
@@ -2391,11 +2513,11 @@ class DependencyTreeModal(ModalScreen):
     """Shows the dependency tree of a job in ASCII."""
     DEFAULT_CSS = """
     DependencyTreeModal { align: center middle; }
-    #dep-dialog { width: 90%; max-width: 86; height: 75%; max-height: 30; background: #161b22;
-                  border: solid #30363d; padding: 1 2; layout: vertical; }
-    #dep-title  { color: #8957e5; text-style: bold; margin-bottom: 1; }
-    #dep-log    { height: 1fr; border: solid #21262d; background: #0d1117; }
-    #btn-dep-close { background: #21262d; color: #c9d1d9; border: none;
+    #dep-dialog { width: 90%; max-width: 86; height: 75%; max-height: 30; background: $sq-panel;
+                  border: solid $sq-line; padding: 1 2; layout: vertical; }
+    #dep-title  { color: $sq-violet; text-style: bold; margin-bottom: 1; }
+    #dep-log    { height: 1fr; border: solid $sq-elevated; background: $sq-bg; }
+    #btn-dep-close { background: $sq-elevated; color: $sq-fg; border: none;
                      min-width: 14; margin-top: 1; }
     """
 
@@ -2408,7 +2530,7 @@ class DependencyTreeModal(ModalScreen):
             yield Label(f"Dependencies for job {self._jobid} — loading...",
                         id="dep-title")
             yield RichLog(id="dep-log", highlight=False, markup=False, wrap=False)
-            yield Button("✕  Close  [Esc]", id="btn-dep-close")
+            yield Button("Close  Esc", id="btn-dep-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -2423,38 +2545,38 @@ class DependencyTreeModal(ModalScreen):
             return
         log = self.query_one("#dep-log", RichLog)
         STATE_ICONS = {
-            "RUNNING":   ("▶", "bold cyan"),
-            "COMPLETED": ("✓", "bold green"),
-            "PENDING":   ("⏳", "white"),
-            "FAILED":    ("✗", "bold red"),
-            "TIMEOUT":   ("⏱", "bold yellow"),
-            "CANCELLED": ("⊘", "yellow"),
-            "UNKNOWN":   ("?", "dim"),
+            "RUNNING":   ("▶", f"bold {C.INFO}"),
+            "COMPLETED": ("✓", f"bold {C.OK}"),
+            "PENDING":   ("·", C.FG_MUTED),
+            "FAILED":    ("✗", f"bold {C.ERR}"),
+            "TIMEOUT":   ("⧗", f"bold {C.WARN}"),
+            "CANCELLED": ("⊘", C.WARN),
+            "UNKNOWN":   ("?", C.FG_FAINT),
         }
         if not tree:
-            log.write(Text("  No dependencies found or job not in scontrol.", style="dim"))
+            log.write(Text("  No dependencies found or job not in scontrol.", style=C.FG_FAINT))
             self.query_one("#dep-title", Label).update(
-                f"Dependencies for [bold cyan]{self._jobid}[/] — none")
+                f"Dependencies for [bold {C.INFO}]{self._jobid}[/] — none")
             return
         self.query_one("#dep-title", Label).update(
-            f"Dependency tree — job [bold cyan]{self._jobid}[/]")
+            f"Dependency tree — job [bold {C.INFO}]{self._jobid}[/]")
         for row in tree:
             depth, jid, state, dep_str, name = row
-            icon, col = STATE_ICONS.get(state, ("?", "dim"))
+            icon, col = STATE_ICONS.get(state, ("?", C.FG_FAINT))
             if depth == 0:
                 prefix = ""
             else:
                 prefix = "  " * (depth - 1) + "  └─ depends on: "
             dep_info = f"  [dep: {dep_str}]" if dep_str not in ("(none)", "(null)") else ""
             line = Text()
-            line.append(prefix, style="#484f58")
+            line.append(prefix, style=C.FG_FAINT)
             line.append(f"{icon} ", style=col)
-            line.append(f"Job {jid}", style="bold white")
+            line.append(f"Job {jid}", style=f"bold {C.FG}")
             if name:
-                line.append(f" ({name})", style="#8b949e")
+                line.append(f" ({name})", style=C.FG_MUTED)
             line.append(f"  [{state}]", style=col)
             if dep_info:
-                line.append(dep_info, style="#484f58")
+                line.append(dep_info, style=C.FG_FAINT)
             log.write(line)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -2471,11 +2593,11 @@ class EfficiencyModal(ModalScreen):
     DEFAULT_CSS = """
     EfficiencyModal { align: center middle; }
     #eff-dialog { width: 92%; max-width: 92; height: 80%; max-height: 34;
-                  background: #161b22; border: solid #1f6feb; padding: 1 2;
+                  background: $sq-panel; border: solid $sq-primary; padding: 1 2;
                   layout: vertical; }
-    #eff-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
-    #eff-log   { height: 1fr; border: solid #21262d; background: #0d1117; }
-    #btn-eff-close { background: #21262d; color: #c9d1d9; border: none;
+    #eff-title { color: $sq-primary; text-style: bold; margin-bottom: 1; }
+    #eff-log   { height: 1fr; border: solid $sq-elevated; background: $sq-bg; }
+    #btn-eff-close { background: $sq-elevated; color: $sq-fg; border: none;
                      min-width: 14; margin-top: 1; }
     """
 
@@ -2488,7 +2610,7 @@ class EfficiencyModal(ModalScreen):
         with Vertical(id="eff-dialog"):
             yield Label(f"Efficiency for job {self._jobid} — loading…", id="eff-title")
             yield RichLog(id="eff-log", highlight=False, markup=False, wrap=False)
-            yield Button("✕  Close  [Esc]", id="btn-eff-close")
+            yield Button("Close  Esc", id="btn-eff-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -2504,29 +2626,29 @@ class EfficiencyModal(ModalScreen):
         log = self.query_one("#eff-log", RichLog)
         title = self.query_one("#eff-title", Label)
         if not rec:
-            title.update(f"[yellow]Efficiency — job {self._jobid}: no accounting data[/]")
-            log.write(Text("  sacct returned nothing for this job.", style="dim"))
-            log.write(Text("  Accounting may be disabled, or the job is too old.", style="dim"))
+            title.update(f"[{C.WARN}]Efficiency — job {self._jobid}: no accounting data[/]")
+            log.write(Text("  sacct returned nothing for this job.", style=C.FG_FAINT))
+            log.write(Text("  Accounting may be disabled, or the job is too old.", style=C.FG_FAINT))
             return
         verdict, vstyle = efficiency_verdict(rec)
-        title.update(f"Efficiency — job [bold cyan]{self._jobid}[/] {self._job_name}")
+        title.update(f"Efficiency — job [bold {C.INFO}]{self._jobid}[/] {self._job_name}")
 
         def line(t="", s="white"):
             log.write(Text(t, style=s))
 
         def meter(label, pct, detail, invert_ok=False):
             if pct is None:
-                line(f"  {label:<10} n/a   {detail}", "dim")
+                line(f"  {label:<10} n/a   {detail}", C.FG_FAINT)
                 return
             shown = min(int(pct), 100)
             col = bar_color(100 - shown) if not invert_ok else bar_color(shown)
             line(f"  {label:<10} [{make_bar(shown, 28)}] {pct:>6.1f}%   {detail}", col)
 
-        line(f"  State     : {rec['state']}   Exit: {rec['exitcode']}", "white")
+        line(f"  State     : {rec['state']}   Exit: {rec['exitcode']}", C.FG)
         line(f"  Wall time : {rec['elapsed_s']/3600:.2f} h over "
-             f"{rec['ncpus']} CPU(s) on {rec['nnodes']} node(s)", "white")
+             f"{rec['ncpus']} CPU(s) on {rec['nnodes']} node(s)", C.FG)
         line("")
-        line("── EFFICIENCY " + "─" * 50, "bold #30363d")
+        line("── EFFICIENCY " + "─" * 50, "bold #29313c")
         meter("CPU", rec["cpu_eff"],
               f"used {rec['totalcpu_s']/3600:.2f} h of {rec['cpu_hours']:.2f} core-hours reserved")
         meter("Memory", rec["mem_eff"],
@@ -2537,14 +2659,14 @@ class EfficiencyModal(ModalScreen):
             line(f"  Unused RAM: {rec['wasted_mem_mb']/1024:.2f} GB reserved and never touched",
                  "yellow" if rec["wasted_mem_mb"] > 1024 else "dim")
         line("")
-        line("── RESOURCES BILLED " + "─" * 44, "bold #30363d")
-        line(f"  CPU-hours : {rec['cpu_hours']:.2f}", "#79c0ff")
+        line("── RESOURCES BILLED " + "─" * 44, "bold #29313c")
+        line(f"  CPU-hours : {rec['cpu_hours']:.2f}", C.PRIMARY_SOFT)
         if rec["gpus"]:
-            line(f"  GPU-hours : {rec['gpu_hours']:.2f}  ({rec['gpus']} GPU(s))", "bold #f0883e")
+            line(f"  GPU-hours : {rec['gpu_hours']:.2f}  ({rec['gpus']} GPU(s))", "bold #dd8a4c")
         line("")
-        line("── SUGGESTION " + "─" * 50, "bold #30363d")
+        line("── SUGGESTION " + "─" * 50, "bold #29313c")
         for tip in efficiency_suggestions(rec):
-            line(f"  • {tip}", "#8b949e")
+            line(f"  • {tip}", C.FG_MUTED)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-eff-close":
@@ -2560,11 +2682,11 @@ class PriorityModal(ModalScreen):
     DEFAULT_CSS = """
     PriorityModal { align: center middle; }
     #prio-dialog { width: 92%; max-width: 92; height: 80%; max-height: 32;
-                   background: #161b22; border: solid #8957e5; padding: 1 2;
+                   background: $sq-panel; border: solid $sq-violet; padding: 1 2;
                    layout: vertical; }
-    #prio-title { color: #a371f7; text-style: bold; margin-bottom: 1; }
-    #prio-log   { height: 1fr; border: solid #21262d; background: #0d1117; }
-    #btn-prio-close { background: #21262d; color: #c9d1d9; border: none;
+    #prio-title { color: $sq-violet-hover; text-style: bold; margin-bottom: 1; }
+    #prio-log   { height: 1fr; border: solid $sq-elevated; background: $sq-bg; }
+    #btn-prio-close { background: $sq-elevated; color: $sq-fg; border: none;
                       min-width: 14; margin-top: 1; }
     """
 
@@ -2580,7 +2702,7 @@ class PriorityModal(ModalScreen):
         with Vertical(id="prio-dialog"):
             yield Label(f"Why is job {self._jobid} waiting? — loading…", id="prio-title")
             yield RichLog(id="prio-log", highlight=False, markup=False, wrap=True)
-            yield Button("✕  Close  [Esc]", id="btn-prio-close")
+            yield Button("Close  Esc", id="btn-prio-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -2598,56 +2720,56 @@ class PriorityModal(ModalScreen):
             return
         log = self.query_one("#prio-log", RichLog)
         self.query_one("#prio-title", Label).update(
-            f"Why is job [bold cyan]{self._jobid}[/] waiting?")
+            f"Why is job [bold {C.INFO}]{self._jobid}[/] waiting?")
 
         def line(t="", s="white"):
             log.write(Text(t, style=s))
 
         reason = (self._reason or "").strip()
-        line("── BLOCKING REASON " + "─" * 45, "bold #30363d")
-        line(f"  Slurm reports: {reason or '(none recorded)'}", "bold yellow")
+        line("── BLOCKING REASON " + "─" * 45, "bold #29313c")
+        line(f"  Slurm reports: {reason or '(none recorded)'}", f"bold {C.WARN}")
         explanation = explain_pending_reason(reason)
         if explanation:
-            line(f"  {explanation}", "white")
+            line(f"  {explanation}", C.FG)
         if est:
-            line(f"  Estimated start: {est}", "bold cyan")
+            line(f"  Estimated start: {est}", f"bold {C.INFO}")
         line("")
 
         if rank and total:
-            line("── QUEUE POSITION " + "─" * 46, "bold #30363d")
+            line("── QUEUE POSITION " + "─" * 46, "bold #29313c")
             scope = f"partition {self._partition}" if self._partition else "the cluster"
-            line(f"  #{rank} of {total} pending jobs in {scope}", "white")
+            line(f"  #{rank} of {total} pending jobs in {scope}", C.FG)
             pct = int((1 - (rank - 1) / total) * 100) if total else 0
             line(f"  [{make_bar(pct, 30)}] ahead of {pct}% of the queue", bar_color(pct))
             line("")
 
         if prio:
-            line("── PRIORITY BREAKDOWN " + "─" * 42, "bold #30363d")
-            line(f"  Total priority: {prio['total']}", "bold white")
+            line("── PRIORITY BREAKDOWN " + "─" * 42, "bold #29313c")
+            line(f"  Total priority: {prio['total']}", f"bold {C.FG}")
             factors = [("Age", prio["age"]), ("Fairshare", prio["fairshare"]),
                        ("Job size", prio["jobsize"]), ("Partition", prio["partition"]),
                        ("QOS", prio["qos"]), ("TRES", prio["tres"])]
             biggest = max((v for _, v in factors), default=0) or 1
             for label, value in factors:
                 width = int(24 * value / biggest)
-                line(f"  {label:<12} {value:>8}  {'█' * width}", "#79c0ff")
+                line(f"  {label:<12} {value:>8}  {'█' * width}", C.PRIMARY_SOFT)
             if prio.get("nice"):
-                line(f"  Nice penalty {prio['nice']:>8}", "dim")
+                line(f"  Nice penalty {prio['nice']:>8}", C.FG_FAINT)
             dominant = max(factors, key=lambda kv: kv[1])[0] if any(v for _, v in factors) else ""
             if dominant:
-                line(f"  Largest contribution: {dominant}", "dim")
+                line(f"  Largest contribution: {dominant}", C.FG_FAINT)
             line("")
         else:
-            line("  (sprio is unavailable on this cluster — no priority breakdown)", "dim")
+            line("  (sprio is unavailable on this cluster — no priority breakdown)", C.FG_FAINT)
             line("")
 
         if share:
-            line("── YOUR FAIRSHARE " + "─" * 46, "bold #30363d")
+            line("── YOUR FAIRSHARE " + "─" * 46, "bold #29313c")
             fs = share["fairshare"]
             pct = int(max(0.0, min(1.0, fs)) * 100)
             line(f"  Fairshare factor: {fs:.4f}  [{make_bar(pct, 24)}]", bar_color(pct))
             line(f"  Effective usage : {share['effective_usage']:.4f}"
-                 f"   Account: {share['account']}", "dim")
+                 f"   Account: {share['account']}", C.FG_FAINT)
             if fs < 0.2:
                 line("  Your recent usage is high, which lowers the priority of new jobs.",
                      "yellow")
@@ -2665,14 +2787,14 @@ class TextPromptModal(ModalScreen[Optional[str]]):
     """One-line text prompt. Returns the entered text, or None if cancelled."""
     DEFAULT_CSS = """
     TextPromptModal { align: center middle; }
-    #prompt-box { width: 80%; max-width: 64; height: auto; background: #161b22;
-                  border: solid #1f6feb; padding: 1 2; }
-    #prompt-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
-    #prompt-input { border: solid #30363d; background: #0d1117; color: #c9d1d9; }
-    #prompt-input:focus { border: solid #58a6ff; }
+    #prompt-box { width: 80%; max-width: 64; height: auto; background: $sq-panel;
+                  border: solid $sq-primary; padding: 1 2; }
+    #prompt-title { color: $sq-primary; text-style: bold; margin-bottom: 1; }
+    #prompt-input { border: solid $sq-line; background: $sq-bg; color: $sq-fg; }
+    #prompt-input:focus { border: solid $sq-primary; }
     #prompt-buttons { height: 3; margin-top: 1; align: right middle; }
-    #btn-prompt-ok { background: #238636; color: white; border: none; min-width: 12; margin-right: 1; }
-    #btn-prompt-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    #btn-prompt-ok { background: $sq-ok; color: white; border: none; min-width: 12; margin-right: 1; }
+    #btn-prompt-cancel { background: $sq-elevated; color: $sq-fg; border: none; min-width: 12; }
     """
 
     def __init__(self, title: str, placeholder: str = "", value: str = "") -> None:
@@ -2686,8 +2808,8 @@ class TextPromptModal(ModalScreen[Optional[str]]):
             yield Label(self._title, id="prompt-title")
             yield Input(value=self._value, placeholder=self._placeholder, id="prompt-input")
             with Horizontal(id="prompt-buttons"):
-                yield Button("✓  OK", id="btn-prompt-ok")
-                yield Button("✕  Cancel", id="btn-prompt-cancel")
+                yield Button("OK", id="btn-prompt-ok")
+                yield Button("Cancel", id="btn-prompt-cancel")
 
     def on_mount(self) -> None:
         self.query_one("#prompt-input", Input).focus()
@@ -2714,13 +2836,13 @@ class TemplatePickerModal(ModalScreen):
     DEFAULT_CSS = """
     TemplatePickerModal { align: center middle; }
     #tpl-box { width: 80%; max-width: 70; height: auto; max-height: 28;
-               background: #161b22; border: solid #1f6feb; padding: 1 2; }
-    #tpl-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
+               background: $sq-panel; border: solid $sq-primary; padding: 1 2; }
+    #tpl-title { color: $sq-primary; text-style: bold; margin-bottom: 1; }
     #tpl-table { height: auto; max-height: 16; }
     #tpl-buttons { height: 3; margin-top: 1; align: left middle; }
-    #btn-tpl-load   { background: #238636; color: white; border: none; min-width: 14; margin-right: 1; }
-    #btn-tpl-delete { background: #da3633; color: white; border: none; min-width: 14; margin-right: 1; }
-    #btn-tpl-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    #btn-tpl-load   { background: $sq-ok; color: white; border: none; min-width: 14; margin-right: 1; }
+    #btn-tpl-delete { background: $sq-err; color: white; border: none; min-width: 14; margin-right: 1; }
+    #btn-tpl-cancel { background: $sq-elevated; color: $sq-fg; border: none; min-width: 12; }
     """
 
     def __init__(self, templates: list[dict]) -> None:
@@ -2729,26 +2851,26 @@ class TemplatePickerModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="tpl-box"):
-            yield Label("📑  Saved templates", id="tpl-title")
+            yield Label("Saved templates", id="tpl-title")
             tbl = DataTable(id="tpl-table")
             tbl.cursor_type = "row"
             tbl.add_columns("NAME", "SCRIPT", "PARTITION", "CPUs", "MEM", "TIME")
             yield tbl
             with Horizontal(id="tpl-buttons"):
-                yield Button("▶  Load", id="btn-tpl-load")
-                yield Button("🗑  Delete", id="btn-tpl-delete")
-                yield Button("✕  Cancel  [Esc]", id="btn-tpl-cancel")
+                yield Button("Load", id="btn-tpl-load")
+                yield Button("Delete", id="btn-tpl-delete")
+                yield Button("Cancel  Esc", id="btn-tpl-cancel")
 
     def on_mount(self) -> None:
         tbl = self.query_one("#tpl-table", DataTable)
         if not self._templates:
-            tbl.add_row(Text("(no templates saved yet)", style="dim italic"),
+            tbl.add_row(Text("(no templates saved yet)", style=f"{C.FG_FAINT} italic"),
                         *[Text("") for _ in range(5)])
             return
         for t in self._templates:
             v = t["values"]
             tbl.add_row(
-                Text(t["name"], style="bold yellow"),
+                Text(t["name"], style=C.FG),
                 Text(os.path.basename(v.get("script", ""))[:24]),
                 Text(v.get("partition", "")), Text(v.get("cpus", "")),
                 Text(v.get("mem", "")), Text(v.get("time", "")),
@@ -2782,16 +2904,16 @@ class BulkCancelModal(ModalScreen[Optional[list]]):
     DEFAULT_CSS = """
     BulkCancelModal { align: center middle; }
     #bulk-box { width: 88%; max-width: 78; height: auto; max-height: 30;
-                background: #161b22; border: double #f85149; padding: 1 2; }
-    #bulk-title { color: #f85149; text-style: bold; margin-bottom: 1; }
-    #bulk-list { height: auto; max-height: 14; border: solid #21262d;
-                 background: #0d1117; margin-bottom: 1; }
-    #bulk-warn { color: #d29922; margin-bottom: 1; }
-    #bulk-input { border: solid #30363d; background: #0d1117; color: #c9d1d9; }
-    #bulk-input:focus { border: solid #f85149; }
+                background: $sq-panel; border: double $sq-err-hover; padding: 1 2; }
+    #bulk-title { color: $sq-err-hover; text-style: bold; margin-bottom: 1; }
+    #bulk-list { height: auto; max-height: 14; border: solid $sq-elevated;
+                 background: $sq-bg; margin-bottom: 1; }
+    #bulk-warn { color: $sq-warn-hover; margin-bottom: 1; }
+    #bulk-input { border: solid $sq-line; background: $sq-bg; color: $sq-fg; }
+    #bulk-input:focus { border: solid $sq-err-hover; }
     #bulk-buttons { height: 3; margin-top: 1; align: right middle; }
-    #btn-bulk-go { background: #da3633; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-bulk-cancel { background: #21262d; color: #c9d1d9; border: none; min-width: 12; }
+    #btn-bulk-go { background: $sq-err; color: white; border: none; min-width: 18; margin-right: 1; }
+    #btn-bulk-cancel { background: $sq-elevated; color: $sq-fg; border: none; min-width: 12; }
     """
     CONFIRM_WORD = "CANCEL"
 
@@ -2802,15 +2924,15 @@ class BulkCancelModal(ModalScreen[Optional[list]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="bulk-box"):
-            yield Label(f"⚠  Cancel {len(self._jobs)} job(s) — {self._description}",
+            yield Label(f"Cancel {len(self._jobs)} job(s) — {self._description}",
                         id="bulk-title")
             yield RichLog(id="bulk-list", highlight=False, markup=False, wrap=False)
             yield Label(f"This cannot be undone. Type {self.CONFIRM_WORD} to confirm:",
                         id="bulk-warn")
             yield Input(placeholder=self.CONFIRM_WORD, id="bulk-input")
             with Horizontal(id="bulk-buttons"):
-                yield Button(f"⚠  Cancel {len(self._jobs)} jobs", id="btn-bulk-go")
-                yield Button("✕  Go back  [Esc]", id="btn-bulk-cancel")
+                yield Button(f"Cancel {len(self._jobs)} jobs", id="btn-bulk-go")
+                yield Button("Go back  Esc", id="btn-bulk-cancel")
 
     def on_mount(self) -> None:
         log = self.query_one("#bulk-list", RichLog)
@@ -2818,16 +2940,16 @@ class BulkCancelModal(ModalScreen[Optional[list]]):
             log.write(Text(
                 f"  {j.get('jobid',''):<12} {j.get('state',''):<10} "
                 f"{j.get('partition',''):<12} {j.get('name','')[:28]}",
-                style="white"))
+                style=C.FG))
         if len(self._jobs) > 60:
-            log.write(Text(f"  … and {len(self._jobs) - 60} more", style="dim"))
+            log.write(Text(f"  … and {len(self._jobs) - 60} more", style=C.FG_FAINT))
         self.query_one("#bulk-input", Input).focus()
 
     def _try_confirm(self) -> None:
         typed = self.query_one("#bulk-input", Input).value.strip()
         if typed != self.CONFIRM_WORD:
             self.query_one("#bulk-warn", Label).update(
-                f"[bold red]Type {self.CONFIRM_WORD} exactly to confirm.[/]")
+                f"[bold {C.ERR}]Type {self.CONFIRM_WORD} exactly to confirm.[/]")
             return
         self.dismiss([j["jobid"] for j in self._jobs])
 
@@ -2850,16 +2972,16 @@ class ConfirmModal(ModalScreen[bool]):
     ConfirmModal { align: center middle; }
     #confirm-box {
         width: 85%; max-width: 66; height: auto;
-        background: #161b22; border: double #f85149; padding: 1 2;
+        background: $sq-panel; border: double $sq-err-hover; padding: 1 2;
     }
-    #confirm-title { text-style: bold; color: #f85149; margin-bottom: 1; }
-    #confirm-msg   { color: #c9d1d9; margin-bottom: 1; }
+    #confirm-title { text-style: bold; color: $sq-err-hover; margin-bottom: 1; }
+    #confirm-msg   { color: $sq-fg; margin-bottom: 1; }
     #confirm-buttons { margin-top: 1; align: center middle; height: 3; }
     Button { margin: 0 1; }
-    #btn-yes { background: #da3633; color: white; border: none; }
-    #btn-no  { background: #21262d; color: #c9d1d9; border: none; }
-    #btn-yes:hover { background: #f85149; }
-    #btn-no:hover  { background: #30363d; }
+    #btn-yes { background: $sq-err; color: white; border: none; }
+    #btn-no  { background: $sq-elevated; color: $sq-fg; border: none; }
+    #btn-yes:hover { background: $sq-err-hover; }
+    #btn-no:hover  { background: $sq-line; }
     """
     def __init__(self, title: str, message: str) -> None:
         super().__init__()
@@ -2870,8 +2992,8 @@ class ConfirmModal(ModalScreen[bool]):
             yield Label(self._title,   id="confirm-title")
             yield Label(self._message, id="confirm-msg")
             with Horizontal(id="confirm-buttons"):
-                yield Button("✗  Go back",  id="btn-no",  variant="default")
-                yield Button("✓  Confirm",  id="btn-yes", variant="error")
+                yield Button("Go back",  id="btn-no",  variant="default")
+                yield Button("Confirm",  id="btn-yes", variant="error")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "btn-yes")
@@ -2886,11 +3008,11 @@ class ConfirmModal(ModalScreen[bool]):
 class JobDetailModal(ModalScreen):
     DEFAULT_CSS = """
     JobDetailModal { align: center middle; }
-    #detail-box { width: 96%; height: 85%; background: #0d1117; border: solid #30363d; }
-    #detail-title { background: #161b22; color: #58a6ff; text-style: bold; padding: 0 2; height: 1; }
+    #detail-box { width: 96%; height: 85%; background: $sq-bg; border: solid $sq-line; }
+    #detail-title { background: $sq-panel; color: $sq-primary; text-style: bold; padding: 0 2; height: 1; }
     #detail-text  { height: 1fr; padding: 1 2; }
-    #detail-close { background: #21262d; color: #c9d1d9; border: none; margin: 0 2 1 2; width: 100%; }
-    #detail-close:hover { background: #30363d; }
+    #detail-close { background: $sq-elevated; color: $sq-fg; border: none; margin: 0 2 1 2; width: 100%; }
+    #detail-close:hover { background: $sq-line; }
     """
     def __init__(self, jobid: str) -> None:
         super().__init__()
@@ -2900,9 +3022,9 @@ class JobDetailModal(ModalScreen):
         # The scontrol call used to run here, blocking the UI thread for up
         # to the 10 s command timeout before the modal could even be drawn.
         with Vertical(id="detail-box"):
-            yield Label(f"  📋  scontrol show job {self._jobid}", id="detail-title")
+            yield Label(f"  scontrol show job {self._jobid}", id="detail-title")
             yield TextArea("Loading…", id="detail-text", read_only=True)
-            yield Button("✕  Close  [Esc]", id="detail-close")
+            yield Button("Close  Esc", id="detail-close")
 
     def on_mount(self) -> None:
         self._worker_load()
@@ -2965,21 +3087,21 @@ class EditorPickerModal(ModalScreen):
     DEFAULT_CSS = """
     EditorPickerModal { align: center middle; }
     #picker-box {
-        width: 88%; max-width: 62; height: auto; background: #161b22;
-        border: double #1f6feb; padding: 1 2;
+        width: 88%; max-width: 62; height: auto; background: $sq-panel;
+        border: double $sq-primary; padding: 1 2;
     }
-    #picker-title { color: #58a6ff; text-style: bold; margin-bottom: 1; }
-    #picker-path  { color: #484f58; margin-bottom: 1; }
+    #picker-title { color: $sq-primary; text-style: bold; margin-bottom: 1; }
+    #picker-path  { color: $sq-fg-faint; margin-bottom: 1; }
     .editor-btn {
-        width: 100%; background: #21262d; color: #c9d1d9;
+        width: 100%; background: $sq-elevated; color: $sq-fg;
         border: none; margin-bottom: 1;
     }
-    .editor-btn:hover { background: #1f6feb; color: white; }
+    .editor-btn:hover { background: $sq-primary; color: white; }
     #btn-picker-cancel {
-        width: 100%; background: #0d1117; color: #484f58;
-        border: solid #30363d; margin-top: 1;
+        width: 100%; background: $sq-bg; color: $sq-fg-faint;
+        border: solid $sq-line; margin-top: 1;
     }
-    #btn-picker-cancel:hover { background: #21262d; color: #c9d1d9; }
+    #btn-picker-cancel:hover { background: $sq-elevated; color: $sq-fg; }
     """
 
     def __init__(self, file_path: str) -> None:
@@ -2988,7 +3110,7 @@ class EditorPickerModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="picker-box"):
-            yield Label("✏  Open with editor", id="picker-title")
+            yield Label("Open with editor", id="picker-title")
             yield Label(f"  {self._file_path}", id="picker-path")
             if AVAILABLE_EDITORS:
                 for label, binary in AVAILABLE_EDITORS:
@@ -2996,7 +3118,7 @@ class EditorPickerModal(ModalScreen):
                                  id=f"editor--{label}", classes="editor-btn")
             else:
                 yield Label("  No editors found in PATH.", id="no-editors")
-            yield Button("✕  Cancel  [Esc]", id="btn-picker-cancel")
+            yield Button("Cancel  Esc", id="btn-picker-cancel")
 
     def on_mount(self) -> None:
         btns = list(self.query(Button))
@@ -3032,29 +3154,29 @@ class ResourceMonitorModal(ModalScreen):
     DEFAULT_CSS = """
     ResourceMonitorModal { align: center middle; }
     #mon-box {
-        width: 98%; height: 95%; background: #0d1117;
-        border: solid #1f6feb; layout: vertical;
+        width: 98%; height: 95%; background: $sq-bg;
+        border: solid $sq-primary; layout: vertical;
     }
     #mon-title {
-        background: #0d1f3c; color: #58a6ff; text-style: bold;
+        background: $sq-panel; color: $sq-primary; text-style: bold;
         padding: 0 2; height: 1;
     }
     #mon-keys-row {
-        height: 1; background: #090f17; border-bottom: solid #1c2128;
+        height: 1; background: $sq-bg; border-bottom: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #mon-keys-label { color: #3d444d; }
+    #mon-keys-label { color: $sq-fg-dim; }
     #mon-scroll { height: 1fr; border: none; }
     #mon-content { height: auto; padding: 1 2; }
     #mon-footer {
-        height: 3; background: #0d1f3c; border-top: solid #1f2d3d;
+        height: 3; background: $sq-panel; border-top: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #mon-refresh-lbl  { color: #58a6ff; margin-right: 2; }
-    #btn-mon-refresh  { background: #21262d; color: #c9d1d9; border: none; margin-right: 1; min-width: 18; }
-    #btn-mon-close    { background: #21262d; color: #c9d1d9; border: none; min-width: 16; }
-    #btn-mon-refresh:hover { background: #1f6feb; color: white; }
-    #btn-mon-close:hover   { background: #30363d; }
+    #mon-refresh-lbl  { color: $sq-primary; margin-right: 2; }
+    #btn-mon-refresh  { background: $sq-elevated; color: $sq-fg; border: none; margin-right: 1; min-width: 18; }
+    #btn-mon-close    { background: $sq-elevated; color: $sq-fg; border: none; min-width: 16; }
+    #btn-mon-refresh:hover { background: $sq-primary; color: white; }
+    #btn-mon-close:hover   { background: $sq-line; }
     """
 
     _timer: Timer | None = None
@@ -3069,7 +3191,7 @@ class ResourceMonitorModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="mon-box"):
             yield Label(
-                f"  📊  Monitor — Job {self._jobid}  ·  {self._job_name}  ·  {self._state}",
+                f"  Monitor — job {self._jobid}  ·  {self._job_name}  ·  {self._state}",
                 id="mon-title"
             )
             with Horizontal(id="mon-keys-row"):
@@ -3082,8 +3204,8 @@ class ResourceMonitorModal(ModalScreen):
                           wrap=False, max_lines=2000)
             with Horizontal(id="mon-footer"):
                 yield Label("", id="mon-refresh-lbl")
-                yield Button("↻  Refresh  [r]", id="btn-mon-refresh")
-                yield Button("✕  Close  [Esc]", id="btn-mon-close")
+                yield Button("Refresh  r", id="btn-mon-refresh")
+                yield Button("Close  Esc", id="btn-mon-close")
 
     def on_mount(self) -> None:
         self._do_refresh()
@@ -3119,9 +3241,9 @@ class ResourceMonitorModal(ModalScreen):
 
         def sep(title: str = "") -> None:
             if title:
-                lines.append((f"── {title} {'─'*(60-len(title))}", "bold #30363d"))
+                lines.append((f"── {title} {'─'*(60-len(title))}", "bold #29313c"))
             else:
-                lines.append(("─" * 64, "#21262d"))
+                lines.append(("─" * 64, C.FG_DIM))
 
         ts = datetime.now().strftime("%H:%M:%S")
 
@@ -3137,18 +3259,18 @@ class ResourceMonitorModal(ModalScreen):
                 total_s    = elapsed_s + timeleft_s
                 pct_time   = int(elapsed_s / total_s * 100) if total_s > 0 else 0
                 bar        = make_bar(pct_time, 30)
-                lines.append((f"  Partition : {p[0]}   State: {p[1]}   CPUs: {p[4]}   Mem: {p[5]}   GPUs: {p[6]}", "white"))
-                lines.append((f"  Nodes     : {p[7]}", "white"))
-                lines.append((f"  Elapsed   : {p[2]}  /  Left: {p[3]}", "white"))
+                lines.append((f"  Partition : {p[0]}   State: {p[1]}   CPUs: {p[4]}   Mem: {p[5]}   GPUs: {p[6]}", C.FG))
+                lines.append((f"  Nodes     : {p[7]}", C.FG))
+                lines.append((f"  Elapsed   : {p[2]}  /  Left: {p[3]}", C.FG))
                 col = bar_color(pct_time)
                 lines.append((f"  Timeline  : [{bar}] {pct_time}%", col))
         else:
-            lines.append(("  Job not found in queue (may have already finished)", "dim"))
+            lines.append(("  Job not found in queue (may have already finished)", C.FG_FAINT))
 
         # ── SSTAT (actual CPU/MEM for the job) ──
         sep("USAGE VIA SSTAT (job accounting)")
         sstat = get_job_sstat(jobid)
-        lines.append((f"  AvgCPU: {sstat['avg_cpu']}   MaxRSS: {sstat['max_rss']}   Tasks: {sstat['tasks']}", "cyan"))
+        lines.append((f"  AvgCPU: {sstat['avg_cpu']}   MaxRSS: {sstat['max_rss']}   Tasks: {sstat['tasks']}", C.INFO))
 
         # ── NODES ──
         nodes = get_job_nodes(jobid)
@@ -3156,7 +3278,7 @@ class ResourceMonitorModal(ModalScreen):
         max_nodes = CONFIG["monitor"]["max_nodes"]
         if not nodes:
             sep("NODES")
-            lines.append(("  No nodes assigned (job still PENDING?)", "dim"))
+            lines.append(("  No nodes assigned (job still PENDING?)", C.FG_FAINT))
         else:
             for node in nodes[:max_nodes]:
                 sep(f"NODE: {node}")
@@ -3182,9 +3304,9 @@ class ResourceMonitorModal(ModalScreen):
                             f"  GPU  [{make_bar(gpu_pct, 20)}] {gpu_pct:>3}%   "
                             f"{info['gpu_alloc']}/{info['gpu_total']} GPUs allocated",
                             bar_color(gpu_pct)))
-                    lines.append((f"  State: {info['state']}", "dim"))
+                    lines.append((f"  State: {info['state']}", C.FG_FAINT))
                 else:
-                    lines.append(("  (scontrol returned no data for this node)", "dim"))
+                    lines.append(("  (scontrol returned no data for this node)", C.FG_FAINT))
 
                 if not use_ssh:
                     continue
@@ -3192,8 +3314,8 @@ class ResourceMonitorModal(ModalScreen):
                 # ── Live utilisation, only if SSH to compute nodes is allowed ──
                 gpus = get_node_gpu_info(node)
                 if gpus:
-                    lines.append(("  ── live via ssh ───────────────────────────────────", "#30363d"))
-                    lines.append(("  GPU  IDX  NAME                      UTIL       MEM USED / TOTAL       TEMP    POWER", "bold #58a6ff"))
+                    lines.append(("  ── live via ssh ───────────────────────────────────", C.FG_DIM))
+                    lines.append(("  GPU  IDX  NAME                      UTIL       MEM USED / TOTAL       TEMP    POWER", "bold #4d8dfb"))
                     for g in gpus:
                         util_bar = make_bar(g["util"], 16)
                         util_col = bar_color(g["util"])
@@ -3209,7 +3331,7 @@ class ResourceMonitorModal(ModalScreen):
                 live = get_node_cpu_mem(node)
                 if live.get("mem_total_kb"):
                     if not gpus:
-                        lines.append(("  ── live via ssh ───────────────────────────────────", "#30363d"))
+                        lines.append(("  ── live via ssh ───────────────────────────────────", C.FG_DIM))
                     used_gb  = live["mem_used_kb"] / 1024 / 1024
                     total_gb = live["mem_total_kb"] / 1024 / 1024
                     lines.append((
@@ -3220,7 +3342,7 @@ class ResourceMonitorModal(ModalScreen):
 
         sep()
         source = "scontrol + ssh" if CONFIG["monitor"]["use_ssh"] else "scontrol only (ssh disabled)"
-        lines.append((f"  Last update: {ts}  │  Job {jobid}  │  source: {source}", "dim"))
+        lines.append((f"  Last update: {ts}  │  Job {jobid}  │  source: {source}", C.FG_FAINT))
 
         self.app.call_from_thread(self._apply_monitor, lines, ts)
 
@@ -3237,47 +3359,47 @@ class ResourceMonitorModal(ModalScreen):
 class LogViewerModal(ModalScreen):
     DEFAULT_CSS = """
     LogViewerModal { align: center middle; }
-    #log-box { width: 98%; height: 95%; background: #0d1117; border: solid #238636; }
-    #log-title { background: #0f2b0f; color: #3fb950; text-style: bold; padding: 0 2; height: 1; }
+    #log-box { width: 98%; height: 95%; background: $sq-bg; border: solid $sq-ok; }
+    #log-title { background: $sq-panel; color: $sq-ok; text-style: bold; padding: 0 2; height: 1; }
     #log-tab-row {
-        height: 3; background: #161b22; border-bottom: solid #30363d;
+        height: 3; background: $sq-panel; border-bottom: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #btn-show-stdout { background: #1f6feb; color: white; border: none; margin-right: 1; min-width: 18; }
-    #btn-show-stderr { background: #9e6a03; color: white; border: none; margin-right: 1; min-width: 18; }
-    #btn-show-stdout:hover { background: #388bfd; }
-    #btn-show-stderr:hover { background: #d29922; }
-    #path-label { color: #484f58; margin-left: 2; }
-    #log-content { height: 1fr; background: #0d1117; color: #c9d1d9; border: none; padding: 0 1; }
+    #btn-show-stdout { background: $sq-primary; color: white; border: none; margin-right: 1; min-width: 18; }
+    #btn-show-stderr { background: $sq-warn; color: white; border: none; margin-right: 1; min-width: 18; }
+    #btn-show-stdout:hover { background: $sq-primary-hover; }
+    #btn-show-stderr:hover { background: $sq-warn-hover; }
+    #path-label { color: $sq-fg-faint; margin-left: 2; }
+    #log-content { height: 1fr; background: $sq-bg; color: $sq-fg; border: none; padding: 0 1; }
     #log-footer-row {
-        height: 3; background: #161b22; border-top: solid #30363d;
+        height: 3; background: $sq-panel; border-top: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #refresh-label   { color: #3fb950; margin-right: 2; }
-    #btn-log-refresh { background: #21262d; color: #c9d1d9; border: none; margin-right: 1; min-width: 18; }
-    #btn-log-refresh  { background: #21262d; color: #c9d1d9; border: none; margin-right: 1; min-width: 16; }
-    #btn-open-editor  { background: #6e40c9; color: white;   border: none; margin-right: 1; min-width: 22; }
-    #btn-log-close    { background: #21262d; color: #c9d1d9; border: none; min-width: 16; }
-    #btn-log-refresh:hover  { background: #30363d; }
-    #btn-open-editor:hover  { background: #8957e5; }
-    #btn-log-close:hover    { background: #30363d; }
+    #refresh-label   { color: $sq-ok; margin-right: 2; }
+    #btn-log-refresh { background: $sq-elevated; color: $sq-fg; border: none; margin-right: 1; min-width: 18; }
+    #btn-log-refresh  { background: $sq-elevated; color: $sq-fg; border: none; margin-right: 1; min-width: 16; }
+    #btn-open-editor  { background: $sq-violet; color: white;   border: none; margin-right: 1; min-width: 22; }
+    #btn-log-close    { background: $sq-elevated; color: $sq-fg; border: none; min-width: 16; }
+    #btn-log-refresh:hover  { background: $sq-line; }
+    #btn-open-editor:hover  { background: $sq-violet; }
+    #btn-log-close:hover    { background: $sq-line; }
     #log-keys-row {
-        height: 1; background: #0a0f14; border-top: solid #1c2128;
+        height: 1; background: $sq-bg; border-top: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #log-keys-label { color: #3d444d; }
+    #log-keys-label { color: $sq-fg-dim; }
     #log-search-row {
-        height: 3; background: #161b22; border-top: solid #30363d;
+        height: 3; background: $sq-panel; border-top: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #log-search-lbl { color: #8b949e; margin-right: 1; width: 10; }
-    #log-search { width: 1fr; max-width: 48; border: solid #30363d;
-                  background: #0d1117; color: #c9d1d9; margin-right: 2; }
-    #log-search:focus { border: solid #58a6ff; }
-    #log-match-lbl { color: #3fb950; }
-    #btn-errors-only { background: #21262d; color: #c9d1d9; border: none;
+    #log-search-lbl { color: $sq-fg-muted; margin-right: 1; width: 10; }
+    #log-search { width: 1fr; max-width: 48; border: solid $sq-line;
+                  background: $sq-bg; color: $sq-fg; margin-right: 2; }
+    #log-search:focus { border: solid $sq-primary; }
+    #log-match-lbl { color: $sq-ok; }
+    #btn-errors-only { background: $sq-elevated; color: $sq-fg; border: none;
                        min-width: 18; margin-left: 2; }
-    #btn-errors-only.on { background: #9e6a03; color: white; }
+    #btn-errors-only.on { background: $sq-warn; color: white; }
     """
 
     _showing: str = "stdout"
@@ -3304,21 +3426,21 @@ class LogViewerModal(ModalScreen):
         self._errors_only = False
 
     def compose(self) -> ComposeResult:
-        live_indicator = "  🔴 LIVE" if self._live else "  📁 HISTORY"
-        title = f"  📄  Job {self._jobid}  ·  {self._job_name}  ·  {self._state}{live_indicator}"
+        live_indicator = "  ·  live" if self._live else "  ·  static"
+        title = f"  Log — job {self._jobid}  ·  {self._job_name}  ·  {self._state}{live_indicator}"
         with Vertical(id="log-box"):
             yield Label(title, id="log-title")
             with Horizontal(id="log-tab-row"):
-                yield Button("📤 stdout", id="btn-show-stdout")
-                yield Button("⚠  stderr", id="btn-show-stderr")
+                yield Button("stdout", id="btn-show-stdout")
+                yield Button("stderr", id="btn-show-stderr")
                 yield Label("", id="path-label")
             yield RichLog(id="log-content", highlight=True, markup=False, wrap=True)
             with Horizontal(id="log-search-row"):
-                yield Label("🔎 Filter:", id="log-search-lbl")
+                yield Label("Filter", id="log-search-lbl")
                 yield Input(placeholder="text or /regex/ …  (press / to focus)",
                             id="log-search")
                 yield Label("", id="log-match-lbl")
-                yield Button("⚠  Errors only", id="btn-errors-only")
+                yield Button("Errors only", id="btn-errors-only")
             with Horizontal(id="log-keys-row"):
                 yield Label(
                     "  /: search  │  ↑↓: scroll  │  PgUp/PgDn  │  r: refresh  │  "
@@ -3327,11 +3449,11 @@ class LogViewerModal(ModalScreen):
                     id="log-keys-label"
                 )
             with Horizontal(id="log-footer-row"):
-                live_txt = "🔴 Live" if self._live else "📁 Static"
+                live_txt = "live" if self._live else "static"
                 yield Label(live_txt, id="refresh-label")
-                yield Button("↻  Refresh  [r]",   id="btn-log-refresh")
-                yield Button("✏  Editor  [e]",     id="btn-open-editor")
-                yield Button("✕  Close  [Esc]",    id="btn-log-close")
+                yield Button("Refresh  r",   id="btn-log-refresh")
+                yield Button("Editor  e",     id="btn-open-editor")
+                yield Button("Close  Esc",    id="btn-log-close")
 
     def on_mount(self) -> None:
         self._show_stream("stdout")
@@ -3413,16 +3535,28 @@ class LogViewerModal(ModalScreen):
     WARN_KEYS    = ("warning", "warn", "deprecat")
     SUCCESS_KEYS = ("success", "done", "finished", "completed")
 
+    #  Severity is decided once and named, so the errors-only filter can ask
+    #  what a line *is* instead of comparing rendered style strings.
     @classmethod
-    def line_style(cls, line: str) -> str:
+    def classify(cls, line: str) -> str:
+        """'error' | 'warn' | 'ok' | 'plain' for one log line."""
         lower = line.lower()
         if any(k in lower for k in cls.ERROR_KEYS):
-            return "bold red"
+            return "error"
         if any(k in lower for k in cls.WARN_KEYS):
-            return "yellow"
+            return "warn"
         if any(k in lower for k in cls.SUCCESS_KEYS):
-            return "bold green"
-        return "#c9d1d9"
+            return "ok"
+        return "plain"
+
+    @classmethod
+    def line_style(cls, line: str) -> str:
+        return {
+            "error": f"bold {C.ERR}",
+            "warn":  C.WARN,
+            "ok":    C.OK,
+            "plain": C.FG,
+        }[cls.classify(line)]
 
     @work(thread=True, exclusive=True, group="logview")
     def _show_stream(self, which: str) -> None:
@@ -3449,7 +3583,7 @@ class LogViewerModal(ModalScreen):
         self._sync_header(which, path)
         log = self.query_one("#log-content", RichLog)
         log.clear()
-        log.write(Text(msg, style="dim italic"))
+        log.write(Text(msg, style=f"{C.FG_FAINT} italic"))
         self.query_one("#log-match-lbl", Label).update("")
 
     def _apply_stream_lines(self, which: str, path: str, lines: list[str],
@@ -3504,7 +3638,7 @@ class LogViewerModal(ModalScreen):
         log.clear()
         buf = self._buffers.get(self._showing, [])
         if not buf:
-            log.write(Text("(File is empty)", style="dim italic"))
+            log.write(Text("(File is empty)", style=f"{C.FG_FAINT} italic"))
             self.query_one("#log-match-lbl", Label).update("")
             return
 
@@ -3513,9 +3647,10 @@ class LogViewerModal(ModalScreen):
         for line in buf:
             if not line:
                 continue
-            style = self.line_style(line)
-            if self._errors_only and style not in ("bold red", "yellow"):
+            level = self.classify(line)
+            if self._errors_only and level not in ("error", "warn"):
                 continue
+            style = self.line_style(line)
             if match and not match(line):
                 continue
             log.write(Text(line, style=style))
@@ -3525,7 +3660,7 @@ class LogViewerModal(ModalScreen):
         if match or self._errors_only:
             label.update(f"  {shown} / {len(buf)} lines")
             if shown == 0:
-                log.write(Text("(no matching lines)", style="dim italic"))
+                log.write(Text("(no matching lines)", style=f"{C.FG_FAINT} italic"))
         else:
             label.update(f"  {len(buf)} lines")
         log.scroll_end(animate=False)
@@ -3540,66 +3675,54 @@ class StatsBar(Static):
         pd = s.get("PENDING",    s.get("PD", 0))
         cg = s.get("COMPLETING", s.get("CG", 0))
         text = Text()
-        text.append(f"  ⏱ {last_update}", style="dim")
-        text.append("    │    ", style="dim")
-        text.append(f"TOTAL {stats['total']}", style="bold white")
-        text.append("  •  ", style="dim")
-        text.append(f"MINE {stats['mine']}", style="bold yellow")
-        text.append("    │    ", style="dim")
-        text.append(f"▶ RUNNING {r}", style="bold green")
-        text.append("  ")
-        text.append(f"⧗ PENDING {pd}", style="bold cyan")
-        text.append("  ")
-        text.append(f"↺ COMPLETING {cg}", style="green")
-        text.append("    │    ", style="dim")
-        text.append(f"🖥  GPUs in use: {stats['running_gpus']}", style="bold magenta")
+        text.append(f"  {last_update}", style=C.FG_FAINT)
+        text.append("    │    ", style=C.FG_FAINT)
+        text.append(f"TOTAL {stats['total']}", style=f"bold {C.FG}")
+        text.append("  •  ", style=C.FG_FAINT)
+        text.append(f"MINE {stats['mine']}", style=f"bold {C.FG}")
+        text.append("    │    ", style=C.FG_FAINT)
+        text.append(f"RUNNING {r}", style=f"bold {C.OK}")
+        text.append("   ")
+        text.append(f"PENDING {pd}", style=f"bold {C.INFO}")
+        text.append("   ")
+        text.append(f"COMPLETING {cg}", style=C.OK)
+        text.append("    │    ", style=C.FG_FAINT)
+        text.append(f"GPUs in use {stats['running_gpus']}", style=f"bold {C.VIOLET}")
         self.update(text)
 
 
 class ActionBar(Static):
     DEFAULT_CSS = """
     ActionBar {
-        height: 5; background: #0d1117;
-        border-top: solid #30363d; padding: 0 1; layout: vertical;
+        height: 7; background: $sq-panel;
+        border-top: solid $sq-line; padding: 0 1; layout: vertical;
     }
-    #action-row-1 { height: 2; align: left middle; }
-    #action-row-2 { height: 2; align: left middle; }
-    ActionBar Button {
-        margin: 0 1 0 0; height: 3; border: none; min-width: 22;
-        content-align: center middle;
+    #action-row-1 { height: 3; align: left middle; }
+    #action-row-2 { height: 3; align: left middle; }
+    ActionBar Button { min-width: 20; }
+    #selected-label  {
+        color: $sq-fg-muted; margin-right: 2; width: 20; height: 3;
+        content-align: left middle;
     }
-    #selected-label  { color: #8b949e; margin-right: 2; width: 20; height: 3; content-align: left middle; }
     #selected-spacer { width: 20; margin-right: 2; height: 3; }
-    #btn-detail  { background: #1f6feb; color: white; }
-    #btn-logs    { background: #238636; color: white; }
-    #btn-monitor { background: #6e40c9; color: white; }
-    #btn-hold    { background: #9e6a03; color: white; }
-    #btn-release { background: #1a7f37; color: white; }
-    #btn-scancel { background: #da3633; color: white; }
-    #btn-detail:hover   { background: #388bfd; }
-    #btn-logs:hover     { background: #2ea043; }
-    #btn-monitor:hover  { background: #8957e5; }
-    #btn-hold:hover     { background: #d29922; }
-    #btn-release:hover  { background: #2ea043; }
-    #btn-scancel:hover  { background: #f85149; }
     """
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="action-row-1"):
             yield Label("Job: -", id="selected-label")
-            yield Button("D - Details",  id="btn-detail")
-            yield Button("L - View Logs", id="btn-logs")
-            yield Button("M - Monitor",  id="btn-monitor")
+            yield Button("Details  d",  id="btn-detail")
+            yield Button("Logs  l",      id="btn-logs")
+            yield Button("Monitor  m",  id="btn-monitor")
         with Horizontal(id="action-row-2"):
             yield Label("", id="selected-spacer")
-            yield Button("H - Hold",     id="btn-hold")
-            yield Button("U - Release",  id="btn-release")
-            yield Button("X - Cancel", id="btn-scancel")
+            yield Button("Hold  h",     id="btn-hold")
+            yield Button("Release  u",  id="btn-release")
+            yield Button("Cancel  x",  id="btn-scancel")
 
     def set_selected(self, jobid: str | None, pinned: bool = False) -> None:
         lbl = self.query_one("#selected-label", Label)
         if jobid:
-            lbl.update(("📌 " if pinned else "") + "Job: " + jobid)
+            lbl.update(("★ " if pinned else "") + "Job: " + jobid)
         else:
             lbl.update("Job: -")
 
@@ -3691,16 +3814,16 @@ class HistoryTable(DataTable):
             col_keys = [col for col, _ in self.COLS]
             def hv(key, _e=e, _st=st):
                 vals = {
-                    "JOBID":      Text(_e.get("jobid", ""),      style="bold yellow"),
-                    "NAME":       Text(_e.get("name", ""),       style="white"),
-                    "USER":       Text(_e.get("user", ""),       style="white"),
-                    "PARTITION":  Text(_e.get("partition", ""),  style="white"),
+                    "JOBID":      Text(_e.get("jobid", ""),      style=f"bold {C.FG}"),
+                    "NAME":       Text(_e.get("name", ""),       style=C.FG),
+                    "USER":       Text(_e.get("user", ""),       style=C.FG),
+                    "PARTITION":  Text(_e.get("partition", ""),  style=C.FG),
                     "STATE":      Text(_st,                      style=state_style(_st)),
-                    "CPUs":       Text(_e.get("cpus", ""),       style="white"),
-                    "MEM":        Text(_e.get("mem",  ""),       style="white"),
-                    "GPUs":       Text(_e.get("gpus", ""),       style="cyan"),
-                    "FIRST SEEN": Text(_e.get("first_seen", ""), style="dim"),
-                    "LAST SEEN":  Text(_e.get("last_seen",  ""), style="dim"),
+                    "CPUs":       Text(_e.get("cpus", ""),       style=C.FG),
+                    "MEM":        Text(_e.get("mem",  ""),       style=C.FG),
+                    "GPUs":       Text(_e.get("gpus", ""),       style=C.INFO),
+                    "FIRST SEEN": Text(_e.get("first_seen", ""), style=C.FG_FAINT),
+                    "LAST SEEN":  Text(_e.get("last_seen",  ""), style=C.FG_FAINT),
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[hv(k) for k in col_keys])
@@ -3718,18 +3841,18 @@ class SqueueTable(DataTable):
     # Full set shown on wide terminals (≥ 140 cols)
     COLS_FULL = [
         ("JOBID", 10), ("PARTITION", 11), ("NAME", 20), ("USER", 12),
-        ("STATE", 11), ("TIME", 8), ("TIME LEFT", 9), ("EST. START", 13),
-        ("CPUs", 5), ("MEM", 7), ("GPUs", 5), ("NODES", 12), ("REASON", 24),
+        ("STATE", 11), ("TIME", 10), ("TIME LEFT", 11), ("EST. START", 13),
+        ("CPUs", 5), ("MEM", 7), ("GPUs", 5), ("NODES", 14), ("REASON", 22),
     ]
     # Compact set for narrow terminals (< 140 cols)
     COLS_COMPACT = [
         ("JOBID", 10), ("NAME", 18), ("USER", 10),
-        ("STATE", 11), ("TIME LEFT", 9), ("EST. START", 13),
+        ("STATE", 11), ("TIME LEFT", 11), ("EST. START", 13),
         ("GPUs", 5), ("REASON", 20),
     ]
     # Minimal set for very narrow terminals (< 90 cols)
     COLS_MINIMAL = [
-        ("JOBID", 10), ("NAME", 16), ("STATE", 11), ("TIME LEFT", 9),
+        ("JOBID", 10), ("NAME", 16), ("STATE", 11), ("TIME LEFT", 11),
     ]
 
     COLS = COLS_FULL   # active set, updated on resize
@@ -3774,7 +3897,7 @@ class SqueueTable(DataTable):
         new_cursor = None
         pins = self.pinned
         for idx, j in enumerate(jobs):
-            rs = "bold yellow" if j["user"] == MY_USER else "white"
+            rs = f"bold {C.FG}" if j["user"] == MY_USER else C.FG_MUTED
             st = j["state"]
             def c(val, extra=""): return Text(val, style=f"{rs} {extra}".strip())
             est = j.get("est_start", "")
@@ -3785,13 +3908,13 @@ class SqueueTable(DataTable):
             col_keys = [col for col, _ in self.COLS]
             def cv(key):
                 vals = {
-                    "JOBID": Text(j["jobid"], style="bold magenta") if is_pinned
+                    "JOBID": Text(j["jobid"], style=f"bold {C.VIOLET}") if is_pinned
                              else c(j["jobid"]),
                     "PARTITION": c(j["partition"]),
                     "NAME": c(name_cell),   "USER": c(j["user"]),
                     "STATE": Text(st, style=state_style(st)),
                     "TIME": c(j["time"]),   "TIME LEFT": c(j["time_left"]),
-                    "EST. START": Text(est or "—", style="cyan" if est else "dim"),
+                    "EST. START": Text(est or "—", style=C.INFO if est else "dim"),
                     "CPUs": c(j["cpus"]),   "MEM": c(j["mem"]),
                     "GPUs": c(j["gpus"]),   "NODES": c(j["nodes"]),
                     "REASON": c(j["reason"]),
@@ -3865,9 +3988,9 @@ class MyJobsTable(DataTable):
         mine = [j for j in jobs if j.get("user") == MY_USER]
         if not mine:
             self.add_row(
-                Text("—", style="dim"),
-                Text(f"No jobs found for user {MY_USER}", style="dim italic"),
-                *[Text("", style="dim")] * (len(self.COLS) - 2),
+                Text("—", style=C.FG_FAINT),
+                Text(f"No jobs found for user {MY_USER}", style=f"{C.FG_FAINT} italic"),
+                *[Text("", style=C.FG_FAINT)] * (len(self.COLS) - 2),
             )
             return
         new_cursor = None
@@ -3880,17 +4003,17 @@ class MyJobsTable(DataTable):
             def mv(key):
                 vals = {
                     "JOBID": Text(j["jobid"],
-                                  style="bold magenta" if is_pinned else "bold yellow"),
-                    "NAME":  Text(name_cell,      style="bold yellow"),
+                                  style=f"bold {C.VIOLET}" if is_pinned else "bold yellow"),
+                    "NAME":  Text(name_cell,      style=f"bold {C.FG}"),
                     "STATE": Text(st,             style=state_style(st)),
-                    "TIME":  Text(j["time"],      style="yellow"),
-                    "TIME LEFT": Text(j["time_left"], style="yellow"),
-                    "EST. START": Text(est or "—", style="cyan" if est else "dim"),
-                    "CPUs":  Text(j["cpus"],      style="yellow"),
-                    "MEM":   Text(j["mem"],       style="yellow"),
-                    "GPUs":  Text(j["gpus"],      style="yellow"),
-                    "NODES": Text(j["nodes"],     style="yellow"),
-                    "REASON":Text(j["reason"],    style="dim"),
+                    "TIME":  Text(j["time"],      style=C.FG),
+                    "TIME LEFT": Text(j["time_left"], style=C.FG),
+                    "EST. START": Text(est or "—", style=C.INFO if est else "dim"),
+                    "CPUs":  Text(j["cpus"],      style=C.FG),
+                    "MEM":   Text(j["mem"],       style=C.FG),
+                    "GPUs":  Text(j["gpus"],      style=C.FG),
+                    "NODES": Text(j["nodes"],     style=C.FG),
+                    "REASON":Text(j["reason"],    style=C.FG_FAINT),
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[mv(k) for k in col_keys])
@@ -3949,20 +4072,20 @@ class SinfoTable(DataTable):
         self._last_nodes = nodes
         self.clear()
         if not nodes:
-            self.add_row(*[Text("n/a", style="dim")] * len(self.COLS)); return
+            self.add_row(*[Text("n/a", style=C.FG_FAINT)] * len(self.COLS)); return
         for n in nodes:
             st = n["state"]
-            color = self.STATE_COLORS.get(st.lower().rstrip("*"), "white")
+            color = self.STATE_COLORS.get(st.lower().rstrip("*"), C.FG)
             col_keys = [col for col, _ in self.COLS]
             def sv(key, _n=n, _st=st, _c=color):
                 vals = {
                     "NODE":        Text(_n["node"],      style=f"bold {_c}"),
-                    "PARTITION":   Text(_n["partition"], style="white"),
+                    "PARTITION":   Text(_n["partition"], style=C.FG),
                     "STATE":       Text(_st,             style=_c),
-                    "CPU A/I/O/T": Text(_n["cpu_aiotd"], style="white"),
-                    "MEM (MB)":    Text(_n["mem"],       style="white"),
-                    "GRES":        Text(_n["gres"],      style="cyan"),
-                    "FEATURES":    Text(_n["features"],  style="dim"),
+                    "CPU A/I/O/T": Text(_n["cpu_aiotd"], style=C.FG),
+                    "MEM (MB)":    Text(_n["mem"],       style=C.FG),
+                    "GRES":        Text(_n["gres"],      style=C.INFO),
+                    "FEATURES":    Text(_n["features"],  style=C.FG_FAINT),
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[sv(k) for k in col_keys])
@@ -4012,14 +4135,14 @@ class ReservationTable(DataTable):
         self._last_rows = reservations
         self.clear()
         if not reservations:
-            self.add_row(*([Text("", style="dim")] * max(0, len(self.COLS) - 1)),
-                         Text("No reservations on this cluster", style="dim italic"))
+            self.add_row(*([Text("", style=C.FG_FAINT)] * max(0, len(self.COLS) - 1)),
+                         Text("No reservations on this cluster", style=f"{C.FG_FAINT} italic"))
             return
         for res in reservations:
             label, style = res["_status"]
             mine = res["_mine"]
-            marker = Text("✓" if mine else ("⚠" if res["_blocks"] else "·"),
-                          style="bold green" if mine
+            marker = Text("✓" if mine else ("▲" if res["_blocks"] else "·"),
+                          style=f"bold {C.OK}" if mine
                           else ("bold yellow" if res["_blocks"] else "dim"))
             who = ",".join(res["users"] + res["accounts"])[:20] or "—"
             col_keys = [col for col, _ in self.COLS]
@@ -4028,16 +4151,16 @@ class ReservationTable(DataTable):
                 vals = {
                     "":          _m,
                     "NAME":      Text(_r["name"][:18],
-                                      style="bold yellow" if _r["_mine"] else "white"),
+                                      style=f"bold {C.FG}" if _r["_mine"] else C.FG_MUTED),
                     "STATE":     Text(_l, style=_s),
-                    "NODES":     Text(_r["nodes"][:18] or "—", style="cyan"),
-                    "COUNT":     Text(_r["node_cnt"] or "—", style="white"),
+                    "NODES":     Text(_r["nodes"][:18] or "—", style=C.INFO),
+                    "COUNT":     Text(_r["node_cnt"] or "—", style=C.FG),
                     "PARTITION": Text((_r["partition"] or "—").replace("(null)", "—"),
-                                      style="white"),
-                    "START":     Text(_r["start_time"][:16].replace("T", " "), style="dim"),
-                    "END":       Text(_r["end_time"][:16].replace("T", " "), style="dim"),
-                    "USERS/ACCOUNTS": Text(_w, style="white"),
-                    "FLAGS":     Text(",".join(_r["flags"])[:20] or "—", style="dim"),
+                                      style=C.FG),
+                    "START":     Text(_r["start_time"][:16].replace("T", " "), style=C.FG_FAINT),
+                    "END":       Text(_r["end_time"][:16].replace("T", " "), style=C.FG_FAINT),
+                    "USERS/ACCOUNTS": Text(_w, style=C.FG),
+                    "FLAGS":     Text(",".join(_r["flags"])[:20] or "—", style=C.FG_FAINT),
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[value(k) for k in col_keys])
@@ -4086,10 +4209,10 @@ class WatchlistTable(DataTable):
         self.clear()
         if not rows:
             self.add_row(
-                Text("—", style="dim"),
+                Text("—", style=C.FG_FAINT),
                 Text("Nothing pinned — press P on a job to watch it",
-                     style="dim italic"),
-                *[Text("", style="dim")] * (len(self.COLS) - 2))
+                     style=f"{C.FG_FAINT} italic"),
+                *[Text("", style=C.FG_FAINT)] * (len(self.COLS) - 2))
             return
         new_cursor = None
         for idx, row in enumerate(rows):
@@ -4098,14 +4221,14 @@ class WatchlistTable(DataTable):
 
             def value(key, _r=row, _st=state):
                 vals = {
-                    "JOBID":     Text(_r["jobid"], style="bold yellow"),
-                    "NAME":      Text((_r.get("name") or "")[:22], style="white"),
+                    "JOBID":     Text(_r["jobid"], style=f"bold {C.FG}"),
+                    "NAME":      Text((_r.get("name") or "")[:22], style=C.FG),
                     "STATE":     Text(_st or "…", style=state_style(_st) if _st else "dim"),
-                    "TIME":      Text(_r.get("time", ""), style="white"),
-                    "TIME LEFT": Text(_r.get("time_left", ""), style="white"),
-                    "NODES":     Text((_r.get("nodes") or "")[:14], style="white"),
-                    "REASON":    Text((_r.get("reason") or "")[:22], style="dim"),
-                    "PINNED":    Text(_r.get("added", "")[:16], style="dim"),
+                    "TIME":      Text(_r.get("time", ""), style=C.FG),
+                    "TIME LEFT": Text(_r.get("time_left", ""), style=C.FG),
+                    "NODES":     Text((_r.get("nodes") or "")[:14], style=C.FG),
+                    "REASON":    Text((_r.get("reason") or "")[:22], style=C.FG_FAINT),
+                    "PINNED":    Text(_r.get("added", "")[:16], style=C.FG_FAINT),
                 }
                 return vals.get(key, Text(""))
             self.add_row(*[value(k) for k in col_keys])
@@ -4126,23 +4249,23 @@ class EventLog(RichLog):
         past = load_event_log(n=200)
         if past:
             self.write(Text.assemble(
-                ("─" * 22 + " previous session " + "─" * 21, "dim #484f58")))
+                ("─" * 22 + " previous session " + "─" * 21, "dim #6a7583")))
             for line in past:
                 if line.startswith("[") and "] " in line:
                     end = line.index("] ")
                     self.write(Text.assemble(
-                        (line[:end + 1] + " ", "dim #484f58"),
-                        (line[end + 2:],        "#6e7681"),
+                        (line[:end + 1] + " ", "dim #6a7583"),
+                        (line[end + 2:],        C.FG_FAINT),
                     ))
                 else:
-                    self.write(Text(line, style="dim"))
+                    self.write(Text(line, style=C.FG_FAINT))
             self.write(Text.assemble(
-                ("─" * 22 + " current session " + "─" * 23,  "dim #30363d")))
+                ("─" * 22 + " current session " + "─" * 23,  "dim #29313c")))
         self.scroll_end(animate=False)
 
     def log_event(self, msg: str, style: str = "white") -> None:
         ts = datetime.now().strftime("%H:%M:%S")
-        self.write(Text.assemble((f"[{ts}] ", "dim"), (msg, style)))
+        self.write(Text.assemble((f"[{ts}] ", C.FG_FAINT), (msg, style)))
         append_event_log(ts, msg)
 
 
@@ -4155,17 +4278,17 @@ class EventLog(RichLog):
 class HistoryStatsPanel(Static):
     DEFAULT_CSS = """
     HistoryStatsPanel {
-        height: 1fr; layout: vertical; background: #0d1117;
+        height: 1fr; layout: vertical; background: $sq-bg;
     }
     #stats-toolbar {
-        height: 3; background: #161b22; border-bottom: solid #30363d;
+        height: 3; background: $sq-panel; border-bottom: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #stats-toolbar-label { color: #58a6ff; text-style: bold; margin-right: 2; }
-    #btn-stats-refresh { background: #21262d; color: #c9d1d9; border: none; min-width: 18; margin-right: 1; }
-    #btn-stats-refresh:hover { background: #1f6feb; color: white; }
-    #btn-stats-efficiency { background: #21262d; color: #c9d1d9; border: none; min-width: 22; }
-    #btn-stats-efficiency:hover { background: #9e6a03; color: white; }
+    #stats-toolbar-label { color: $sq-primary; text-style: bold; margin-right: 2; }
+    #btn-stats-refresh { background: $sq-elevated; color: $sq-fg; border: none; min-width: 18; margin-right: 1; }
+    #btn-stats-refresh:hover { background: $sq-primary; color: white; }
+    #btn-stats-efficiency { background: $sq-elevated; color: $sq-fg; border: none; min-width: 22; }
+    #btn-stats-efficiency:hover { background: $sq-warn; color: white; }
     #stats-content {
         height: 1fr; border: none;
     }
@@ -4173,9 +4296,9 @@ class HistoryStatsPanel(Static):
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="stats-toolbar"):
-            yield Label("📊  History analysis",        id="stats-toolbar-label")
-            yield Button("↻  Recalculate",             id="btn-stats-refresh")
-            yield Button("⚡  Efficiency report",       id="btn-stats-efficiency")
+            yield Label("History analysis",           id="stats-toolbar-label")
+            yield Button("Recalculate",                id="btn-stats-refresh")
+            yield Button("Efficiency report",          id="btn-stats-efficiency")
         yield RichLog(id="stats-content", highlight=False, markup=False,
                       wrap=True, max_lines=5000)
 
@@ -4204,45 +4327,45 @@ class HistoryStatsPanel(Static):
         def sep(title: str = "") -> None:
             bar = "─" * max(0, 62 - len(title))
             line(f"── {title} {bar}" if title else "─" * 66,
-                 "bold #30363d" if title else "#21262d")
+                 f"bold {C.FG_MUTED}" if title else C.FG_DIM)
 
         agg = aggregate_efficiency(records)
         if not agg:
-            line("  No accounting data available for your finished jobs.", "dim")
-            line("  sacct must be configured on the cluster for this report.", "dim")
+            line("  No accounting data available for your finished jobs.", C.FG_FAINT)
+            line("  sacct must be configured on the cluster for this report.", C.FG_FAINT)
             return
 
         sep("EFFICIENCY — LAST %d FINISHED JOBS" % agg["jobs"])
         for label, value in (("CPU efficiency", agg["mean_cpu_eff"]),
                              ("Memory efficiency", agg["mean_mem_eff"])):
             if value is None:
-                line(f"  Mean {label:<18}: n/a", "dim")
+                line(f"  Mean {label:<18}: n/a", C.FG_FAINT)
             else:
                 line(f"  Mean {label:<18}: [{make_bar(int(value), 28)}] {value:>5.1f}%",
                      bar_color(100 - int(value)))
         line("")
-        line(f"  Core-hours consumed   : {agg['core_hours']:.1f} h", "#79c0ff")
+        line(f"  Core-hours consumed   : {agg['core_hours']:.1f} h", C.PRIMARY_SOFT)
         line(f"  Core-hours wasted     : {agg['wasted_core_hours']:.1f} h"
              f"  ({agg['wasted_core_hours']/agg['core_hours']*100:.0f}% of the total)"
              if agg["core_hours"] else
              f"  Core-hours wasted     : {agg['wasted_core_hours']:.1f} h",
              "bold red" if agg["wasted_core_hours"] > agg["core_hours"] * 0.4 else "yellow")
         if agg["gpu_hours"]:
-            line(f"  GPU-hours consumed    : {agg['gpu_hours']:.1f} h", "bold #f0883e")
-        line(f"  RAM reserved          : {agg['gb_hours_reserved']:.0f} GB·h", "#79c0ff")
-        line(f"  RAM actually used     : {agg['gb_hours_used']:.0f} GB·h", "#79c0ff")
+            line(f"  GPU-hours consumed    : {agg['gpu_hours']:.1f} h", "bold #dd8a4c")
+        line(f"  RAM reserved          : {agg['gb_hours_reserved']:.0f} GB·h", C.PRIMARY_SOFT)
+        line(f"  RAM actually used     : {agg['gb_hours_used']:.0f} GB·h", C.PRIMARY_SOFT)
 
         sep("CPU EFFICIENCY DISTRIBUTION")
         total = sum(agg["buckets"].values()) or 1
-        colours = {"0-25%": "bold red", "25-50%": "yellow",
-                   "50-75%": "cyan", "75-100%": "bold green"}
+        colours = {"0-25%": f"bold {C.ERR}", "25-50%": C.WARN,
+                   "50-75%": C.INFO, "75-100%": f"bold {C.OK}"}
         for bucket, count in agg["buckets"].items():
             width = int(30 * count / total)
             line(f"  {bucket:<9} [{'█' * width}{'░' * (30 - width)}] {count:>4} jobs",
                  colours[bucket])
 
         sep("BIGGEST WASTE — REVIEW THESE REQUESTS")
-        line(f"  {'JOBID':<12}{'NAME':<22}{'CPU%':>6}{'MEM%':>7}{'WASTED':>10}", "bold #58a6ff")
+        line(f"  {'JOBID':<12}{'NAME':<22}{'CPU%':>6}{'MEM%':>7}{'WASTED':>10}", "bold #4d8dfb")
         for rec in agg["worst"]:
             wasted = rec.get("cpu_hours", 0.0) * max(0.0, 1 - (rec.get("cpu_eff") or 0) / 100)
             if wasted <= 0:
@@ -4253,7 +4376,7 @@ class HistoryStatsPanel(Static):
             line(f"  {rec['jobid']:<12}{name:<22}{cpu:>6}{mem:>7}{wasted:>9.1f}h",
                  efficiency_verdict(rec)[1])
         sep()
-        line("  Press ↻ Recalculate for the history summary.", "dim")
+        line("  Press ↻ Recalculate for the history summary.", C.FG_FAINT)
 
     def render_stats(self, stats: dict, error_patterns: list | None = None) -> None:
         log = self.query_one("#stats-content", RichLog)
@@ -4265,22 +4388,22 @@ class HistoryStatsPanel(Static):
         def sep(title: str = "") -> None:
             if title:
                 bar = "─" * max(0, 62 - len(title))
-                line(f"── {title} {bar}", "bold #30363d")
+                line(f"── {title} {bar}", "bold #29313c")
             else:
-                line("─" * 66, "#21262d")
+                line("─" * 66, C.FG_DIM)
 
         if not stats:
-            line("  No history data yet.", "dim")
+            line("  No history data yet.", C.FG_FAINT)
             return
 
         ts = datetime.now().strftime("%H:%M:%S  %d/%m/%Y")
 
         # ── GENERAL SUMMARY ──
         sep("GENERAL SUMMARY")
-        line(f"  Total jobs in history : {stats['total']}", "white")
-        line(f"  Completed successfully    : {stats['succeeded']}  ({stats['success_rt']}%)", "bold green")
-        line(f"  Failed / Timeout        : {stats['failed']}    ({stats['fail_rt']}%)", "bold red")
-        line(f"  Others (running/pending) : {stats['other']}", "dim")
+        line(f"  Total jobs in history : {stats['total']}", C.FG)
+        line(f"  Completed successfully    : {stats['succeeded']}  ({stats['success_rt']}%)", f"bold {C.OK}")
+        line(f"  Failed / Timeout        : {stats['failed']}    ({stats['fail_rt']}%)", f"bold {C.ERR}")
+        line(f"  Others (running/pending) : {stats['other']}", C.FG_FAINT)
 
         # ── SUCCESS/FAILURE BAR ──
         sep()
@@ -4288,20 +4411,20 @@ class HistoryStatsPanel(Static):
         ok_w   = int(40 * stats["succeeded"] / total) if total else 0
         fail_w = int(40 * stats["failed"]    / total) if total else 0
         rest_w = 40 - ok_w - fail_w
-        ok_bar   = Text("█" * ok_w,   style="bold green")
-        fail_bar = Text("█" * fail_w, style="bold red")
-        rest_bar = Text("░" * rest_w, style="#30363d")
+        ok_bar   = Text("█" * ok_w,   style=f"bold {C.OK}")
+        fail_bar = Text("█" * fail_w, style=f"bold {C.ERR}")
+        rest_bar = Text("░" * rest_w, style=C.FG_DIM)
         full_bar = Text("  [") + ok_bar + fail_bar + rest_bar + Text("]")
-        full_bar += Text(f"  ✓ {stats['success_rt']}%  ✗ {stats['fail_rt']}%", style="white")
+        full_bar += Text(f"  ✓ {stats['success_rt']}%  ✗ {stats['fail_rt']}%", style=C.FG)
         log.write(full_bar)
 
         # ── RESOURCES USED ──
         sep("RESOURCES USED (jobs COMPLETED)")
-        line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", "bold #f0883e")
-        line(f"  CPU-hours total       : {stats['cpu_hours']:.1f} h", "#79c0ff")
+        line(f"  GPU-hours total       : {stats['gpu_hours']:.1f} h", "bold #dd8a4c")
+        line(f"  CPU-hours total       : {stats['cpu_hours']:.1f} h", C.PRIMARY_SOFT)
         avg_h = int(stats["avg_wall_hrs"])
         avg_m = int((stats["avg_wall_hrs"] - avg_h) * 60)
-        line(f"  Average time per job    : {avg_h}h {avg_m:02d}m", "cyan")
+        line(f"  Average time per job    : {avg_h}h {avg_m:02d}m", C.INFO)
 
         # ── BY PARTITION ──
         sep("JOBS BY PARTITION")
@@ -4311,7 +4434,7 @@ class HistoryStatsPanel(Static):
             bar_w = int(20 * count / max_count)
             bar = "█" * bar_w + "░" * (20 - bar_w)
             pct  = round(count / total * 100, 1) if total else 0
-            line(f"  {part:<18}  [{bar}]  {count:>4} jobs  ({pct}%)", "#79c0ff")
+            line(f"  {part:<18}  [{bar}]  {count:>4} jobs  ({pct}%)", C.PRIMARY_SOFT)
 
         # ── TOP JOB NAMES ──
         sep("TOP 10 JOB NAMES")
@@ -4320,7 +4443,7 @@ class HistoryStatsPanel(Static):
         for name, count in by_name[:10]:
             bar_w = int(20 * count / max_name)
             bar = "█" * bar_w + "░" * (20 - bar_w)
-            line(f"  {name[:24]:<24}  [{bar}]  {count:>4}", "white")
+            line(f"  {name[:24]:<24}  [{bar}]  {count:>4}", C.FG)
 
         # ── TIMELINE LAST 30 DAYS ──
         sep("ACTIVITY — LAST 30 DAYS")
@@ -4334,12 +4457,12 @@ class HistoryStatsPanel(Static):
                 bars_txt = Text("  ")
                 for day, cnt in chunk:
                     h = int(8 * cnt / max_day)
-                    col = "bold green" if cnt > 0 else "#21262d"
+                    col = f"bold {C.OK}" if cnt > 0 else C.FG_DIM
                     short_day = day[5:]  # MM-DD
-                    bars_txt += Text(f"{short_day} ", style="#484f58")
+                    bars_txt += Text(f"{short_day} ", style=C.FG_FAINT)
                     bars_txt += Text("█" * h + "░" * (8 - h) + " ", style=col)
                 log.write(bars_txt)
-            line(f"  Max in one day: {max_day} jobs", "dim")
+            line(f"  Max in one day: {max_day} jobs", C.FG_FAINT)
 
         # ── STATE BREAKDOWN ──
         sep("STATES")
@@ -4354,106 +4477,146 @@ class HistoryStatsPanel(Static):
             "PENDING": "white",        "PD": "white",
         }
         for state, count in sorted(stats["states"].items(), key=lambda x: -x[1]):
-            col = state_cols.get(state, "dim")
+            col = state_cols.get(state, C.FG_FAINT)
             pct = round(count / total * 100, 1) if total else 0
             line(f"  {state:<22}  {count:>4} jobs  ({pct}%)", col)
 
         sep()
-        line(f"  Updated: {ts}  │  {len(stats.get('jobs_by_day', {}))} days analysed", "dim")
+        line(f"  Updated: {ts}  │  {len(stats.get('jobs_by_day', {}))} days analysed", C.FG_FAINT)
 
 
 class SlurmDashboard(App):
 
     CSS = """
-    Screen { background: #0d1117; }
-    Header { background: #161b22; color: #58a6ff; text-style: bold; }
-    Footer { background: #161b22; color: #8b949e; }
-    #jobs-panel { height: 1fr; layout: vertical; background: #0d1117; }
-    #jobs-toolbar {
-        height: 3; background: #161b22; border-bottom: solid #30363d;
-        align: left middle; padding: 0 2;
+    /* ─────────────────────────────────────────────────────────────
+       Surfaces: canvas → content → chrome. Colour carries meaning
+       (state, thresholds); chrome stays neutral so the data reads.
+       ───────────────────────────────────────────────────────────── */
+    Screen { background: $sq-bg; }
+    * {
+        scrollbar-background: $sq-surface;
+        scrollbar-background-hover: $sq-surface;
+        scrollbar-background-active: $sq-surface;
+        scrollbar-color: $sq-line-strong;
+        scrollbar-color-hover: $sq-fg-dim;
+        scrollbar-color-active: $sq-primary;
+        scrollbar-corner-color: $sq-surface;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 1;
     }
-    #jobs-toolbar-lbl { color: #58a6ff; text-style: bold; margin-right: 2; }
-    #jobs-info-panel { height: 1fr; padding: 0; }
-    #jobs-info-log   { height: 1fr; border: none; background: #0d1117; }
-    #btn-jobs-new       { background: #238636; color: white; border: none; min-width: 16; margin-right: 1; }
-    #btn-jobs-array     { background: #9e6a03; color: white; border: none; min-width: 13; margin-right: 1; }
-    #btn-jobs-deps      { background: #6e40c9; color: white; border: none; min-width: 12; margin-right: 1; }
-    #btn-jobs-eff       { background: #1f6feb; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-jobs-why       { background: #8957e5; color: white; border: none; min-width: 19; margin-right: 1; }
-    #btn-jobs-bulk      { background: #da3633; color: white; border: none; min-width: 19; }
-    #btn-jobs-new:hover       { background: #2ea043; }
-    #btn-jobs-array:hover     { background: #d29922; }
-    #btn-jobs-deps:hover      { background: #8957e5; }
-    #btn-jobs-eff:hover       { background: #388bfd; }
-    #btn-jobs-why:hover       { background: #a371f7; }
-    #btn-jobs-bulk:hover      { background: #f85149; }
+    Header { background: $sq-panel; color: $sq-fg; text-style: bold; }
+    Footer { background: $sq-panel; color: $sq-fg-muted; }
+    Footer > .footer--key { color: $sq-primary; text-style: bold; }
 
-    Button:focus      { border: tall #58a6ff; }
-    Button.active-log { border: tall #3fb950; text-style: bold; }
-    DataTable:focus   { border: solid #1f6feb; }
-    Input:focus       { border: solid #58a6ff; }
-    StatsBar {
-        height: 1; background: #161b22; color: #c9d1d9;
-        padding: 0 1; border-bottom: solid #30363d;
-        overflow: hidden;
-    }
-    Tabs { background: #161b22; border-bottom: solid #30363d; overflow-x: auto; }
-    Tab { color: #8b949e; }
-    Tab.-active { color: #58a6ff; background: #0d1117; text-style: bold; }
-    DataTable { background: #0d1117; color: #c9d1d9; border: solid #30363d; }
-    DataTable > .datatable--header {
-        background: #161b22; color: #58a6ff; text-style: bold;
-    }
-    DataTable > .datatable--cursor { background: #1f6feb; color: white; }
-    DataTable > .datatable--even-row { background: #0d1117; }
-    DataTable > .datatable--odd-row  { background: #161b22; }
-    EventLog { background: #0d1117; border: solid #30363d; height: 8; max-height: 14; }
     #main-layout { height: 1fr; }
-    #log-label {
-        background: #161b22; color: #58a6ff;
-        padding: 0 1; border-bottom: solid #30363d; height: 1;
+    /* Content tables fill their panel instead of sizing to the row count. */
+    #squeue-table, #mine-table, #sinfo-table, #history-table { height: 1fr; }
+
+    /* ── buttons ───────────────────────────────────────────────────
+       Quiet by default. Exactly one accented action per context, and
+       destructive actions stay muted until hovered.
+       ───────────────────────────────────────────────────────────── */
+    Button {
+        background: $sq-elevated; color: $sq-fg; border: none;
+        min-width: 14; height: 3; margin-right: 1;
+        content-align: center middle;
     }
-    #resv-panel  { height: 1fr; layout: vertical; }
-    #watch-panel { height: 1fr; layout: vertical; }
-    #resv-toolbar, #watch-toolbar {
-        height: 3; background: #161b22; border-bottom: solid #30363d;
+    Button:hover { background: $sq-line-strong; color: $sq-fg; }
+    Button:focus { background: $sq-line-strong; text-style: bold; }
+
+    #btn-submit-run, #btn-jobs-new, #btn-prompt-ok, #btn-tpl-load {
+        background: $sq-primary; color: $sq-bg; text-style: bold;
+    }
+    #btn-submit-run:hover, #btn-jobs-new:hover,
+    #btn-prompt-ok:hover, #btn-tpl-load:hover {
+        background: $sq-primary-hover; color: $sq-bg;
+    }
+
+    #btn-jobs-bulk, #btn-scancel, #btn-tpl-delete { color: $sq-err; }
+    #btn-jobs-bulk:hover, #btn-scancel:hover, #btn-tpl-delete:hover {
+        background: $sq-err; color: $sq-bg; text-style: bold;
+    }
+    #btn-yes, #btn-bulk-go {
+        background: $sq-err; color: $sq-bg; text-style: bold;
+    }
+    #btn-yes:hover, #btn-bulk-go:hover { background: $sq-err-hover; }
+
+    Button.active-log { background: $sq-primary; color: $sq-bg; text-style: bold; }
+
+    /* ── tabs ───────────────────────────────────────────────────── */
+    Tabs { background: $sq-panel; border-bottom: solid $sq-line; overflow-x: auto; }
+    Tab { color: $sq-fg-faint; }
+    Tab:hover { color: $sq-fg; }
+    Tab.-active { color: $sq-primary; text-style: bold; }
+
+    /* ── tables ─────────────────────────────────────────────────── */
+    DataTable {
+        background: $sq-surface; color: $sq-fg;
+        border: solid $sq-line; scrollbar-size-vertical: 1;
+    }
+    DataTable:focus { border: solid $sq-primary; }
+    DataTable > .datatable--header {
+        background: $sq-panel; color: $sq-fg-muted; text-style: bold;
+    }
+    DataTable > .datatable--cursor { background: $sq-primary 30%; color: $sq-fg; }
+    DataTable > .datatable--even-row { background: $sq-surface; }
+    DataTable > .datatable--odd-row  { background: $sq-surface-alt; }
+
+    /* ── inputs ─────────────────────────────────────────────────── */
+    Input {
+        background: $sq-surface; color: $sq-fg;
+        border: solid $sq-line;
+    }
+    Input:focus { border: solid $sq-primary; }
+
+    /* ── shared chrome: every panel toolbar looks the same ──────── */
+    #jobs-toolbar, #history-toolbar, #resv-toolbar,
+    #watch-toolbar, #stats-toolbar {
+        height: 3; background: $sq-panel; border-bottom: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #resv-toolbar-lbl, #watch-toolbar-lbl {
-        color: #58a6ff; text-style: bold; margin-right: 2;
+    #jobs-toolbar-lbl, #history-filter-lbl, #resv-toolbar-lbl,
+    #watch-toolbar-lbl, #stats-toolbar-label {
+        color: $sq-fg; text-style: bold; margin-right: 2;
     }
-    #btn-resv-refresh, #btn-watch-unpin, #btn-watch-clear {
-        background: #21262d; color: #c9d1d9; border: none;
-        min-width: 18; margin-right: 1;
-    }
-    #btn-resv-refresh:hover { background: #1f6feb; color: white; }
-    #btn-watch-unpin:hover  { background: #9e6a03; color: white; }
-    #btn-watch-clear:hover  { background: #6e40c9; color: white; }
-    #resv-summary, #watch-summary { color: #8b949e; margin-left: 2; }
-    #resv-legend { color: #484f58; height: 1; padding: 0 2; }
-    #resv-table, #watch-table { height: 1fr; }
-    #history-panel { height: 1fr; }
-    #history-toolbar {
-        height: 3; background: #161b22; border-bottom: solid #30363d;
-        align: left middle; padding: 0 2;
-    }
-    #history-search {
-        width: 1fr; max-width: 42; border: solid #30363d; background: #0d1117;
-        color: #c9d1d9; margin-right: 2; height: 1;
-    }
-    #history-hint   { color: #484f58; margin-left: 2; }
     #history-action-row {
-        height: 3; background: #161b22; border-top: solid #30363d;
+        height: 3; background: $sq-panel; border-top: solid $sq-line;
         align: left middle; padding: 0 2;
     }
-    #history-selected { color: #8b949e; width: 30; margin-right: 2; }
-    #btn-hist-logs    { background: #238636; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-hist-logs:hover    { background: #2ea043; }
-    #btn-hist-monitor { background: #6e40c9; color: white; border: none; min-width: 18; margin-right: 1; }
-    #btn-hist-monitor:hover { background: #8957e5; }
-    #btn-hist-rerun   { background: #1f6feb; color: white; border: none; min-width: 18; }
-    #btn-hist-rerun:hover   { background: #388bfd; }
+
+    /* height is the outer box: the hairline needs its own row, otherwise
+       the single line of content is squeezed to nothing. */
+    StatsBar {
+        height: 2; background: $sq-panel; color: $sq-fg;
+        padding: 0 1; border-bottom: solid $sq-line; overflow: hidden;
+    }
+
+    /* ── panels ─────────────────────────────────────────────────── */
+    #jobs-panel, #history-panel, #resv-panel, #watch-panel {
+        height: 1fr; layout: vertical;
+    }
+    #jobs-info-panel { height: 1fr; padding: 0; }
+    #jobs-info-log   { height: 1fr; border: none; background: $sq-surface; }
+    #resv-table, #watch-table { height: 1fr; }
+
+    EventLog {
+        background: $sq-surface; border: solid $sq-line; height: 1fr;
+    }
+    #log-label {
+        background: $sq-panel; color: $sq-fg; text-style: bold;
+        padding: 0 1; border-bottom: solid $sq-line; height: 1;
+    }
+
+    /* ── secondary text ─────────────────────────────────────────── */
+    #history-hint, #resv-legend { color: $sq-fg-faint; }
+    #resv-legend { height: 1; padding: 0 2; }
+    #history-selected, #resv-summary, #watch-summary {
+        color: $sq-fg-muted; margin-left: 2;
+    }
+    #history-selected { width: 30; margin-right: 2; margin-left: 0; }
+    #history-search {
+        width: 1fr; max-width: 42; margin-right: 2; height: 1;
+    }
     """
 
     BINDINGS = [
@@ -4480,6 +4643,7 @@ class SlurmDashboard(App):
         ("k", "bulk_cancel",    "Bulk cancel"),
         ("7", "tab_resv",       "Reservations"),
         ("8", "tab_watch",      "Watchlist"),
+        ("9", "tab_log",        "Event log"),
         ("p", "toggle_watch",   "Pin/Unpin"),
     ]
 
@@ -4490,6 +4654,10 @@ class SlurmDashboard(App):
 
     def __init__(self) -> None:
         super().__init__()
+        # Register before the stylesheets are parsed so every $sq-* variable
+        # resolves, including those in modal DEFAULT_CSS blocks.
+        self.register_theme(build_theme())
+        self.theme = "sqdash"
         # Instance state — these were mutable class attributes, i.e. shared by
         # every instance of the app.
         self._prev_states: dict[str, str] = {}
@@ -4505,27 +4673,27 @@ class SlurmDashboard(App):
         yield Header()
         yield StatsBar(id="stats-bar")
         yield Tabs(
-            Tab("⚡ All Jobs",  id="tab-all"),
-            Tab("👤 My Jobs",   id="tab-mine"),
-            Tab("🖥  Nodes",    id="tab-nodes"),
-            Tab("📋 Event Log", id="tab-log"),
-            Tab("🕑 History",   id="tab-history"),
-            Tab("📊 Stats",     id="tab-stats"),
-            Tab("🚀 Jobs",      id="tab-jobs"),
-            Tab("🔒 Reservations", id="tab-resv"),
-            Tab("📌 Watchlist", id="tab-watch"),
+            Tab("1  All Jobs",     id="tab-all"),
+            Tab("2  My Jobs",      id="tab-mine"),
+            Tab("3  Nodes",        id="tab-nodes"),
+            Tab("4  History",      id="tab-history"),
+            Tab("5  Stats",        id="tab-stats"),
+            Tab("6  Jobs",         id="tab-jobs"),
+            Tab("7  Reservations", id="tab-resv"),
+            Tab("8  Watchlist",    id="tab-watch"),
+            Tab("9  Event Log",    id="tab-log"),
         )
         with Container(id="main-layout"):
             yield SqueueTable(id="squeue-table")
             yield MyJobsTable(id="mine-table")
             yield SinfoTable(id="sinfo-table")
             with Vertical(id="log-panel"):
-                yield Label("📋 Event Log — job state changes", id="log-label")
+                yield Label(" Event log — job state changes", id="log-label")
                 yield EventLog(id="event-log", max_lines=200)
             # ── History panel ──
             with Vertical(id="history-panel"):
                 with Horizontal(id="history-toolbar"):
-                    yield Label("🔎 Filter: ", id="history-filter-lbl")
+                    yield Label("Filter", id="history-filter-lbl")
                     yield Input(placeholder="job name / id / state / partition…",
                                 id="history-search")
                     yield Label(
@@ -4535,42 +4703,42 @@ class SlurmDashboard(App):
                 yield HistoryTable(id="history-table")
                 with Horizontal(id="history-action-row"):
                     yield Label("Selected: —", id="history-selected")
-                    yield Button("📄 [l] View Logs",     id="btn-hist-logs")
-                    yield Button("📊 [m] Monitor",       id="btn-hist-monitor")
-                    yield Button("↻  [b] Rerun",         id="btn-hist-rerun")
+                    yield Button("Logs  l",       id="btn-hist-logs")
+                    yield Button("Monitor  m",    id="btn-hist-monitor")
+                    yield Button("Rerun  b",      id="btn-hist-rerun")
             # ── Stats panel ──
             with Vertical(id="stats-panel"):
                 yield HistoryStatsPanel(id="stats-widget")
             # ── Jobs management panel ──
             with Vertical(id="jobs-panel"):
                 with Horizontal(id="jobs-toolbar"):
-                    yield Label("🚀  Job management", id="jobs-toolbar-lbl")
-                    yield Button("▶  New job [n]",          id="btn-jobs-new")
-                    yield Button("⣿  Array [a]",            id="btn-jobs-array")
-                    yield Button("🔗  Deps [e]",             id="btn-jobs-deps")
-                    yield Button("⚡  Efficiency [f]",       id="btn-jobs-eff")
-                    yield Button("⏳  Why pending [w]",      id="btn-jobs-why")
-                    yield Button("⚠  Bulk cancel [k]",      id="btn-jobs-bulk")
+                    yield Label("Job management", id="jobs-toolbar-lbl")
+                    yield Button("New job  n",        id="btn-jobs-new")
+                    yield Button("Array  a",          id="btn-jobs-array")
+                    yield Button("Deps  e",           id="btn-jobs-deps")
+                    yield Button("Efficiency  f",     id="btn-jobs-eff")
+                    yield Button("Why pending  w",    id="btn-jobs-why")
+                    yield Button("Bulk cancel  k",    id="btn-jobs-bulk")
                 with Vertical(id="jobs-info-panel"):
                     yield RichLog(id="jobs-info-log", highlight=False,
                                   markup=False, wrap=True, max_lines=2000)
             # ── Reservations panel ──
             with Vertical(id="resv-panel"):
                 with Horizontal(id="resv-toolbar"):
-                    yield Label("🔒  Cluster reservations", id="resv-toolbar-lbl")
-                    yield Button("↻  Refresh", id="btn-resv-refresh")
+                    yield Label("Reservations", id="resv-toolbar-lbl")
+                    yield Button("Refresh", id="btn-resv-refresh")
                     yield Label("", id="resv-summary")
                 yield ReservationTable(id="resv-table")
                 yield Label(
-                    "  ✓ you may submit into it   ⚠ maintenance that blocks jobs"
-                    "   · other users",
+                    "  ✓ available to you    ▲ maintenance that blocks jobs"
+                    "    · other users",
                     id="resv-legend")
             # ── Watchlist panel ──
             with Vertical(id="watch-panel"):
                 with Horizontal(id="watch-toolbar"):
-                    yield Label("📌  Watchlist", id="watch-toolbar-lbl")
-                    yield Button("📌  Unpin [p]", id="btn-watch-unpin")
-                    yield Button("🧹  Clear finished", id="btn-watch-clear")
+                    yield Label("Watchlist", id="watch-toolbar-lbl")
+                    yield Button("Unpin  p", id="btn-watch-unpin")
+                    yield Button("Clear finished", id="btn-watch-clear")
                     yield Label("", id="watch-summary")
                 yield WatchlistTable(id="watch-table")
         yield ActionBar(id="action-bar")
@@ -4632,7 +4800,7 @@ class SlurmDashboard(App):
         if self._active_tab == "tab-history":
             jobid = self.query_one(HistoryTable).get_selected_jobid()
             lbl   = self.query_one("#history-selected", Label)
-            lbl.update(f"Selected: [bold yellow]{jobid}[/]" if jobid else "Selected: —")
+            lbl.update(f"Selected: [bold {C.WARN}]{jobid}[/]" if jobid else "Selected: —")
 
     def _refresh_history_table(self, filter_text: str = "") -> None:
         ft = self.query_one("#history-search", Input).value if not filter_text else filter_text
@@ -4803,7 +4971,7 @@ class SlurmDashboard(App):
         else:
             hint = "No SubmitLine cached → will be searched in sacct/scontrol/requeue"
         self.push_screen(
-            ConfirmModal("↻  Confirm resubmission", f"Job {jobid}  [{name}]\n{hint}"),
+            ConfirmModal("Confirm resubmission", f"Job {jobid}  [{name}]\n{hint}"),
             callback=lambda ok: self._do_history_rerun(ok, jobid),
         )
 
@@ -4880,12 +5048,12 @@ class SlurmDashboard(App):
 
     def _rerun_ok(self, jobid: str, msg: str) -> None:
         self.notify(msg or f"Job {jobid} resubmitted", severity="information", timeout=7)
-        self.query_one(EventLog).log_event(f"rerun {jobid} → {msg}", "bold green")
+        self.query_one(EventLog).log_event(f"rerun {jobid} → {msg}", f"bold {C.OK}")
         self.refresh_data()
 
     def _rerun_fail(self, jobid: str, err: str) -> None:
         self.notify(f"Error resubmitting {jobid}: {err}", severity="error", timeout=10)
-        self.query_one(EventLog).log_event(f"rerun {jobid} FAIL: {err}", "bold red")
+        self.query_one(EventLog).log_event(f"rerun {jobid} FAIL: {err}", f"bold {C.ERR}")
 
     # ── job actions ──
     def action_job_detail(self) -> None:
@@ -4946,7 +5114,7 @@ class SlurmDashboard(App):
             self.notify(f"Cannot cancel jobs belonging to another user ({user})",
                         severity="error"); return
         self.push_screen(
-            ConfirmModal("⚠  Confirm scancel",
+            ConfirmModal("Confirm cancel",
                          f"Cancel job  {jobid}?  This cannot be undone."),
             callback=lambda ok: self._do_scancel(ok, jobid),
         )
@@ -4958,10 +5126,10 @@ class SlurmDashboard(App):
         _, stderr = run(["scancel", jobid])
         if stderr.strip():
             self.notify(f"scancel error: {stderr.strip()}", severity="error", timeout=6)
-            self.query_one(EventLog).log_event(f"scancel {jobid} ERROR: {stderr.strip()}", "bold red")
+            self.query_one(EventLog).log_event(f"scancel {jobid} ERROR: {stderr.strip()}", f"bold {C.ERR}")
         else:
             self.notify(f"Job {jobid} cancelled", severity="information", timeout=4)
-            self.query_one(EventLog).log_event(f"scancel {jobid} → OK  (by {MY_USER})", "bold yellow")
+            self.query_one(EventLog).log_event(f"scancel {jobid} → OK  (by {MY_USER})", f"bold {C.WARN}")
         self.refresh_data()
 
     def action_job_hold(self) -> None:
@@ -4981,7 +5149,7 @@ class SlurmDashboard(App):
             self.notify(f"hold error: {stderr.strip()}", severity="error", timeout=6)
         else:
             self.notify(f"Job {jobid} placed on hold", severity="information", timeout=3)
-            self.query_one(EventLog).log_event(f"scontrol hold {jobid} → OK", "yellow")
+            self.query_one(EventLog).log_event(f"scontrol hold {jobid} → OK", C.WARN)
         self.refresh_data()
 
     def action_job_release(self) -> None:
@@ -5001,7 +5169,7 @@ class SlurmDashboard(App):
             self.notify(f"release error: {stderr.strip()}", severity="error", timeout=6)
         else:
             self.notify(f"Job {jobid} released", severity="information", timeout=3)
-            self.query_one(EventLog).log_event(f"scontrol release {jobid} → OK", "bold green")
+            self.query_one(EventLog).log_event(f"scontrol release {jobid} → OK", f"bold {C.OK}")
         self.refresh_data()
 
     # ── reservations ────────────────────────────────────────────────────
@@ -5435,6 +5603,7 @@ class SlurmDashboard(App):
 
     def action_tab_jobs(self)  -> None: self.query_one(Tabs).active = "tab-jobs"
     def action_tab_stats(self) -> None: self.query_one(Tabs).active = "tab-stats"
+    def action_tab_log(self)   -> None: self.query_one(Tabs).active = "tab-log"
     def action_tab_resv(self)  -> None: self.query_one(Tabs).active = "tab-resv"
     def action_tab_watch(self) -> None: self.query_one(Tabs).active = "tab-watch"
 
@@ -5496,7 +5665,7 @@ class SlurmDashboard(App):
     def action_bulk_cancel(self) -> None:
         self.push_screen(
             TextPromptModal(
-                "⚠  Bulk cancel — which of your jobs?",
+                "Bulk cancel — which of your jobs?",
                 "pending | running | all | text matching the job name",
                 "pending"),
             callback=self._bulk_collect)
@@ -5547,17 +5716,17 @@ class SlurmDashboard(App):
         if errors:
             self.notify(f"Cancelled {done}/{total}; errors: {errors[0][:120]}",
                         severity="error", timeout=8)
-            log.log_event(f"bulk scancel {done}/{total} — {errors[0][:80]}", "bold red")
+            log.log_event(f"bulk scancel {done}/{total} — {errors[0][:80]}", f"bold {C.ERR}")
         else:
             self.notify(f"Cancelled {done} job(s)", severity="information", timeout=5)
-            log.log_event(f"bulk scancel {done} job(s) by {MY_USER}", "bold yellow")
+            log.log_event(f"bulk scancel {done} job(s) by {MY_USER}", f"bold {C.WARN}")
         self.refresh_data()
 
     def _render_jobs_panel(self) -> None:
         log = self.query_one("#jobs-info-log", RichLog)
         log.clear()
         log.write(Text("── Keyboard shortcuts "
-                       + "─" * 45, style="bold #30363d"))
+                       + "─" * 45, style=f"bold {C.FG_MUTED}"))
         shortcuts = [
             ("N", "New job — sbatch form, with save/load of templates"),
             ("A", "Array expand — per-task states, and rerun only the failed ones"),
@@ -5571,31 +5740,31 @@ class SlurmDashboard(App):
             ("/", "Inside the log viewer: filter lines (text or /regex/)"),
         ]
         for key, desc in shortcuts:
-            line = Text(f"  [{key}]  ", style="bold yellow")
-            line.append(desc, style="white")
+            line = Text(f"  {key:>2}   ", style=f"bold {C.PRIMARY}")
+            line.append(desc, style=C.FG)
             log.write(line)
         log.write(Text(""))
         log.write(Text("── Workflow "
-                       + "─" * 55, style="bold #30363d"))
+                       + "─" * 55, style=f"bold {C.FG_MUTED}"))
         tips = [
             "1. Press N  →  fill the sbatch form  →  save it as a template for next time",
             "2. Select an array job  →  A  →  rerun just the failed tasks",
             "3. A job stuck in PENDING?  →  W tells you what is blocking it",
             "4. After a job finishes  →  F shows whether the request was oversized",
-            "5. Stats tab  →  ⚡ Efficiency report aggregates that across your history",
+            "5. Stats tab  →  Efficiency report aggregates that across your history",
             "6. Pin the jobs you care about with P; they stay on tab 8 after a restart",
             "7. Job will not start?  →  tab 7 shows reservations holding the nodes",
         ]
         for tip in tips:
-            log.write(Text(f"  {tip}", style="#8b949e"))
+            log.write(Text(f"  {tip}", style=C.FG_MUTED))
         log.write(Text(""))
-        log.write(Text("── Configuration " + "─" * 50, style="bold #30363d"))
-        log.write(Text(f"  {CONFIG_FILE}", style="#8b949e"))
-        log.write(Text(f"  templates: {TEMPLATE_FILE}", style="#8b949e"))
-        log.write(Text(f"  watchlist: {WATCHLIST_FILE}", style="#8b949e"))
+        log.write(Text("── Configuration " + "─" * 50, style=f"bold {C.FG_MUTED}"))
+        log.write(Text(f"  {CONFIG_FILE}", style=C.FG_MUTED))
+        log.write(Text(f"  templates: {TEMPLATE_FILE}", style=C.FG_MUTED))
+        log.write(Text(f"  watchlist: {WATCHLIST_FILE}", style=C.FG_MUTED))
         log.write(Text(f"  ssh to compute nodes: "
                        f"{'enabled' if CONFIG['monitor']['use_ssh'] else 'disabled'}",
-                       style="#8b949e"))
+                       style=C.FG_MUTED))
 
 
     def action_manual_refresh(self) -> None:

@@ -4,7 +4,11 @@ A fast, terminal-based user interface (TUI) for monitoring and managing Slurm jo
 
 Running `squeue`, `sacct`, and `tail -f` repeatedly can get tedious. This dashboard provides a centralized, interactive view of your HPC jobs directly from your SSH session, without requiring X11 forwarding, web servers, or complex setups.
 
-![Main Dashboard View](assets/screenshot-main.png)
+![Main dashboard view](assets/screenshot-main.png)
+
+| Reservations | Efficiency report |
+| :--- | :--- |
+| ![Reservations](assets/screenshot-reservations.png) | ![Efficiency](assets/screenshot-efficiency.png) |
 
 ## Features
 
@@ -103,6 +107,32 @@ The dashboard runs entirely in user-space. It acts as a wrapper around standard 
 | `~/.config/slurm_dashboard/config.ini` | Settings (see below) |
 | `~/.config/slurm_dashboard/templates.json` | Saved sbatch templates |
 | `~/.config/slurm_dashboard/watchlist.json` | Pinned jobs |
+
+## Theme
+
+The interface uses a single design-token table (`PALETTE` in the source) that
+feeds both the Textual stylesheets, as `$sq-*` variables, and the Rich styles
+used to paint table cells. Nothing in the UI names a colour directly.
+
+The rules it follows:
+
+- **Neutral chrome, meaningful colour.** Surfaces are a cool graphite ramp.
+  Hue is reserved for job state and utilisation thresholds, so a red cell
+  always means something is wrong.
+- **One accent.** Azure marks focus, selection and the single primary action
+  in each context. Other buttons stay quiet; destructive ones only fill with
+  red on hover.
+- **Emphasis by weight.** Your own jobs are bold rather than tinted, which
+  keeps the state colours legible.
+- **Single-width glyphs only.** Emoji occupy two cells and misalign every
+  column after them, so the UI uses typographic marks (`★`, `✓`, `▲`, `·`).
+
+`tests/test_theme.py` enforces this: it fails if a colour appears outside the
+palette, if a stylesheet hardcodes a hex value, if a theme variable is
+undefined or unused, or if a double-width glyph creeps in.
+
+To restyle the dashboard, edit `PALETTE` — every surface, border and state
+colour follows from it.
 
 ## Configuration
 

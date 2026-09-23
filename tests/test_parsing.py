@@ -116,3 +116,28 @@ class TestFinalState:
         fake_slurm.set("sacct", "")
         sd.sacct_final_state(["--evil", "1"])
         assert all("--evil" not in ",".join(c) for c in fake_slurm.calls)
+
+
+class TestReasonColumn:
+    def test_running_job_reason_is_blank(self, sd, fake_slurm):
+        """%R holds the node list for a running job, which the NODES column
+        already shows; repeating it reads as noise."""
+        fake_slurm.set("squeue",
+            "1|gpu|u|RUNNING|1:00|2:00|4|16G||node07|node07|train")
+        job = sd.parse_squeue()[0]
+        assert job["reason"] == ""
+        assert job["nodes"] == "node07"
+
+    def test_pending_job_keeps_its_reason(self, sd, fake_slurm):
+        fake_slurm.set("squeue",
+            "2|gpu|u|PENDING|0:00|1-00:00:00|4|16G||(Resources)||wait")
+        job = sd.parse_squeue()[0]
+        assert job["reason"] == "(Resources)"
+
+    def test_day_long_time_left_fits_its_column(self, sd):
+        """'1-00:00:00' is ten characters; the column must not clip it."""
+        for table in (sd.SqueueTable, sd.MyJobsTable):
+            for cols in (table.COLS_FULL, table.COLS_COMPACT, table.COLS_MINIMAL):
+                width = dict(cols).get("TIME LEFT")
+                if width is not None:
+                    assert width >= 10, f"{table.__name__}: {width}"

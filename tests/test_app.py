@@ -853,7 +853,9 @@ class TestWatchlist:
                 app.action_toggle_watch()
                 await pilot.pause()
                 label = str(app.query_one("#selected-label", sd.Label).content)
-                assert "📌" in label and "101" in label
+                # One pin glyph everywhere: the action bar uses the same
+                # marker the queue tables put on a pinned row.
+                assert "★" in label and "101" in label
                 app.exit()
         run(scenario())
 

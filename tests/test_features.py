@@ -282,12 +282,21 @@ class TestLogFilter:
         viewer._filter = ""
         assert viewer._matcher() is None
 
-    @pytest.mark.parametrize("line,style", [
-        ("Traceback (most recent call last)", "bold red"),
-        ("CUDA error: out of memory", "bold red"),
-        ("WARNING: deprecated", "yellow"),
-        ("Job completed", "bold green"),
-        ("ordinary output", "#c9d1d9"),
+    @pytest.mark.parametrize("line,level", [
+        ("Traceback (most recent call last)", "error"),
+        ("CUDA error: out of memory", "error"),
+        ("segfault in worker", "error"),
+        ("WARNING: deprecated", "warn"),
+        ("Job completed", "ok"),
+        ("ordinary output", "plain"),
     ])
-    def test_line_classification(self, sd, line, style):
-        assert sd.LogViewerModal.line_style(line) == style
+    def test_line_classification(self, sd, line, level):
+        assert sd.LogViewerModal.classify(line) == level
+
+    def test_styles_come_from_the_palette(self, sd):
+        """Severity colours must be palette tokens, not ad-hoc literals."""
+        palette = set(sd.PALETTE.values())
+        for line in ("error here", "warning here", "done", "plain"):
+            style = sd.LogViewerModal.line_style(line)
+            colour = style.replace("bold ", "").strip()
+            assert colour in palette, f"{colour!r} is not a palette colour"
