@@ -121,6 +121,11 @@ class TestArrayRerun:
         assert sd.build_array_rerun_args(
             "sbatch -a 1-100 j.sh", [4]) == ["sbatch", "--array=4", "j.sh"]
 
+    def test_replaces_attached_short_array_option(self, sd):
+        """getopt's "-a1-100" form would otherwise override the new range."""
+        assert sd.build_array_rerun_args(
+            "sbatch -a1-100 j.sh", [4]) == ["sbatch", "--array=4", "j.sh"]
+
     def test_adds_when_absent(self, sd):
         assert sd.build_array_rerun_args(
             "sbatch j.sh", [1]) == ["sbatch", "--array=1", "j.sh"]
@@ -300,3 +305,67 @@ class TestLogFilter:
             style = sd.LogViewerModal.line_style(line)
             colour = style.replace("bold ", "").strip()
             assert colour in palette, f"{colour!r} is not a palette colour"
+
+
+class TestLogReadingSafety:
+    def test_fifo_is_refused_without_blocking(self, sd, tmp_path):
+        """Another user's --output may point at a FIFO; opening it for
+        reading would block the worker thread forever."""
+        import os
+        fifo = tmp_path / "fifo"
+        os.mkfifo(fifo)
+        assert sd.follow_file(str(fifo), 0) == ([], 0, False)
+
+    def test_huge_append_is_retailed_not_loaded(self, sd, tmp_path, monkeypatch):
+        monkeypatch.setattr(sd, "_TAIL_WINDOW_BYTES", 64)
+        f = tmp_path / "log"
+        f.write_text("a\n")
+        _, offset, _ = sd.follow_file(str(f), 0)
+        with open(f, "a") as fh:
+            fh.write("".join(f"line {i}\n" for i in range(100)))
+        lines, _, reset = sd.follow_file(str(f), offset, max_lines=3)
+        assert reset is True
+        assert lines == ["line 97", "line 98", "line 99"]
+
+    def test_unterminated_last_line_shows_on_first_read(self, sd, tmp_path):
+        f = tmp_path / "log"
+        f.write_text("a\nlast words")
+        lines, _, _ = sd.follow_file(str(f), 0)
+        assert lines == ["a", "last words"]
+
+
+class TestLogPathPatterns:
+    def test_percent_escape_is_literal(self, sd):
+        assert sd._expand_slurm_log_candidates("/l/%%j-%j.out", "55") == ["/l/%j-55.out"]
+
+    def test_zero_padding(self, sd):
+        assert sd._expand_slurm_log_candidates("/l/o.%A_%4a", "9_7") == ["/l/o.9_0007"]
+
+    def test_token_detection(self, sd):
+        assert sd.has_slurm_tokens("out.%j")
+        assert not sd.has_slurm_tokens("100%%")
+        assert not sd.has_slurm_tokens("plain.log")
+
+
+class TestSubmitJob:
+    def test_unbalanced_quotes_in_extra_args_fail_cleanly(self, sd, tmp_path, monkeypatch):
+        monkeypatch.setattr(sd, "run_sbatch", lambda *a, **k: (True, "never"))
+        ok, msg = sd.submit_job({"script": str(tmp_path / "j.sh"),
+                                 "extra": '--comment="oops'})
+        assert ok is False and "extra args" in msg
+
+    def test_tokens_in_a_directory_are_rejected(self, sd, tmp_path, monkeypatch):
+        monkeypatch.setattr(sd, "run_sbatch", lambda *a, **k: (True, "never"))
+        ok, msg = sd.submit_job({"script": str(tmp_path / "j.sh"),
+                                 "output": "logs/%j/out.log"})
+        assert ok is False and "file name" in msg
+
+    def test_home_is_expanded_everywhere(self, sd, tmp_path, monkeypatch):
+        import os
+        monkeypatch.setenv("HOME", str(tmp_path))
+        seen = {}
+        monkeypatch.setattr(sd, "run_sbatch", lambda args, **k: seen.update(args=args) or (True, "ok"))
+        sd.submit_job({"script": "~/j.sh", "output": "~/logs/o.%j"})
+        assert seen["args"][-1] == os.path.join(str(tmp_path), "j.sh")
+        assert f"--output={tmp_path}/logs/o.%j" in seen["args"]
+        assert (tmp_path / "logs").is_dir()

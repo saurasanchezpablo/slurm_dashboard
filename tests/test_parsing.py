@@ -38,6 +38,46 @@ class TestSqueue:
         fake_slurm.set("squeue", "1|p|u|R|1:00|2:00|4|16G|billing=7|n|n|x")
         assert sd.parse_squeue()[0]["gpus"] == ""
 
+    def test_failed_squeue_is_not_an_empty_queue(self, sd, fake_slurm):
+        """A timeout must not read as "every job finished"."""
+        fake_slurm.set("squeue", "", "Command timed out after 10 seconds")
+        assert sd.parse_squeue() is None
+
+    def test_empty_queue_is_an_empty_list(self, sd, fake_slurm):
+        fake_slurm.set("squeue", "")
+        assert sd.parse_squeue() == []
+
+
+class TestGresGpuCount:
+    @pytest.mark.parametrize("gres, count", [
+        ("gpu:2", 2), ("gres/gpu:4", 4), ("gres:gpu:2", 2),
+        ("gpu:a100:4", 4), ("gres/gpu:h100:2", 2),     # model digits are not the count
+        ("gpu:a100:4(IDX:0-3)", 4), ("gres/gpu", 1), ("gpu:a100", 1),
+        ("gpu:a100:2,gpu:v100:2", 4), ("billing=7", 0), ("N/A", 0), ("", 0),
+    ])
+    def test_spellings(self, sd, gres, count):
+        assert sd.gres_gpu_count(gres) == count
+
+
+class TestScontrolField:
+    OUT = ("JobId=12 JobName=x StdOut=/tmp/evil UserId=bob(1)\n"
+           "   UserId=alice(1000) GroupId=g(1) MCS_label=N/A\n"
+           "   JobState=RUNNING Reason=None Dependency=(null)\n"
+           "   WorkDir=/home/alice/my proj\n"
+           "   StdOut=/home/alice/my proj/o.log\n")
+
+    def test_values_keep_their_spaces(self, sd):
+        assert sd.scontrol_field(self.OUT, "WorkDir") == "/home/alice/my proj"
+        assert sd.scontrol_field(self.OUT, "StdOut") == "/home/alice/my proj/o.log"
+
+    def test_job_name_cannot_spoof_later_fields(self, sd):
+        assert sd.scontrol_field(self.OUT, "JobName") == "x StdOut=/tmp/evil UserId=bob(1)"
+        assert sd.scontrol_field(self.OUT, "UserId") == "alice(1000)"
+        assert sd.scontrol_field(self.OUT, "StdOut") != "/tmp/evil"
+
+    def test_missing_key(self, sd):
+        assert sd.scontrol_field(self.OUT, "Command") == ""
+
 
 class TestSinfo:
     def test_features_keep_embedded_separators(self, sd, fake_slurm):
@@ -112,6 +152,15 @@ class TestFinalState:
         sd.sacct_final_state([str(i) for i in range(120)])
         assert len(fake_slurm.calls) == 3
 
+    def test_array_tasks_keep_their_own_state(self, sd, fake_slurm):
+        fake_slurm.set("sacct", "7_1|COMPLETED\n7_2|FAILED\n7_2.batch|FAILED\n")
+        assert sd.sacct_final_state(["7_1", "7_2", "7"]) == {
+            "7_1": "COMPLETED", "7_2": "FAILED", "7": "FAILED"}
+
+    def test_empty_state_column_is_skipped(self, sd, fake_slurm):
+        fake_slurm.set("sacct", "5|\n5.batch|COMPLETED\n")
+        assert sd.sacct_final_state(["5"]) == {"5": "COMPLETED"}
+
     def test_invalid_ids_never_reach_sacct(self, sd, fake_slurm):
         fake_slurm.set("sacct", "")
         sd.sacct_final_state(["--evil", "1"])
@@ -141,3 +190,23 @@ class TestReasonColumn:
                 width = dict(cols).get("TIME LEFT")
                 if width is not None:
                     assert width >= 10, f"{table.__name__}: {width}"
+
+
+class TestDurations:
+    @pytest.mark.parametrize("text, seconds", [
+        ("1-02:03:04", 93784), ("02:03:04", 7384), ("05:06", 306),
+        ("1-12", 129600), ("1-12:30", 131400),     # D-HH and D-HH:MM
+        ("12:34.5", 754.5), ("UNLIMITED", 0), ("", 0),
+    ])
+    def test_slurm_duration(self, sd, text, seconds):
+        assert sd.parse_slurm_duration(text) == seconds
+
+
+class TestCpuSample:
+    def test_busy_share_between_samples(self, sd):
+        before = "cpu  100 0 100 800 0 0 0 0"
+        after  = "cpu  150 0 150 900 0 0 0 0"
+        assert sd._cpu_busy_pct(before, after) == 50
+
+    def test_idle_node_is_zero(self, sd):
+        assert sd._cpu_busy_pct("cpu  1 0 1 100 0", "cpu  1 0 1 200 0") == 0

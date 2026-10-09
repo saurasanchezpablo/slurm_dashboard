@@ -11,7 +11,10 @@ import os
 import sys
 import re
 import json
+import itertools
 import shutil
+import stat
+import tempfile
 import configparser
 from typing import Optional
 from datetime import datetime
@@ -26,6 +29,7 @@ from textual.widgets import (
 from textual.containers import Vertical, Horizontal, Container, VerticalScroll
 from textual.screen import ModalScreen
 from textual import work
+from textual.markup import escape as escape_markup
 from textual.timer import Timer
 from rich.text import Text
 from textual.theme import Theme
@@ -225,7 +229,10 @@ def load_config(path: Path | None = None) -> dict:
             return cfg
         # inline_comment_prefixes is None by default, which would make
         # "use_ssh = true  # explanation" parse as the whole trailing string.
-        parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+        # interpolation=None: a literal "%" (a hook argument, a URL with %20)
+        # would otherwise raise and silently discard the whole file.
+        parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"),
+                                           interpolation=None)
         parser.read(path, encoding="utf-8")
         for section in parser.sections():
             if section not in cfg:
@@ -335,31 +342,41 @@ def load_history() -> list[dict]:
     # drop anything that is not a usable record instead of crashing later.
     if not isinstance(data, list):
         return []
-    return [e for e in data if isinstance(e, dict) and e.get("jobid")]
+    # Every field is used as text (regexes, paths, sorting); a number or
+    # null from a hand-edited file would raise TypeError deep in the UI.
+    return [{str(k): "" if v is None else str(v) for k, v in e.items()}
+            for e in data if isinstance(e, dict) and e.get("jobid")]
 
 def save_history(history: list[dict]) -> None:
     """Atomic write: write to a temp file then rename, so the history JSON
     is never left in a truncated/corrupt state if the process is killed.
-    Created with mode 0600 — it records job names, working directories and
-    log paths, which should not be world-readable on a shared cluster."""
-    tmp = HISTORY_FILE.with_suffix(".tmp")
+
+    The temp file gets a unique name (mkstemp, mode 0600): two dashboards
+    running at once used to share one fixed ".tmp" path and could interleave
+    their writes into invalid JSON.  The file records job names, working
+    directories and log paths, which should not be world-readable."""
+    tmp = None
     try:
         payload = json.dumps(history[-MAX_HISTORY:], indent=2)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, tmp = tempfile.mkstemp(dir=HISTORY_FILE.parent,
+                                   prefix=HISTORY_FILE.name + ".", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)
-        tmp.replace(HISTORY_FILE)
+        os.replace(tmp, HISTORY_FILE)
     except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def append_event_log(ts: str, msg: str) -> None:
     """Append a single event line to the persistent log file."""
     try:
         fd = os.open(EVENT_LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        # The mode above only applies to a new file; tighten an old one too.
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
         # Trim to MAX_EVENT_LOG lines when file exceeds 1 MB
@@ -423,26 +440,33 @@ def upsert_history(history: list[dict], job: dict, paths: dict | None = None) ->
 # ──────────────────────────────────────────────
 #  SLURM HELPERS
 # ──────────────────────────────────────────────
-def run(cmd: list[str], timeout: int = 10) -> tuple[str, str]:
-    """
-    Run a command safely inside a Textual TUI.
-    Redirects stdin to /dev/null to avoid BlockingIOError caused by
-    Textual setting O_NONBLOCK on stdin, and closes all inherited fds.
+# Keyword arguments shared by every subprocess call made from the TUI:
+#   * stdin from /dev/null avoids BlockingIOError (Textual sets O_NONBLOCK
+#     on the terminal) and stops children from stealing keystrokes;
+#   * output is decoded as UTF-8 with replacement, because one job name in
+#     Latin-1 anywhere on the cluster must not blank the whole squeue view.
+_SUBPROCESS_KW = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                      text=True, encoding="utf-8", errors="replace",
+                      close_fds=True)
+
+
+def run(cmd: list[str], timeout: int = 10, cwd: str | None = None) -> tuple[str, str]:
+    """Run a command and return (stdout, stderr).  Never raises.
+
+    A failure (missing binary, timeout, non-zero exit) is reported through
+    stderr, so callers that must tell "no output" from "command failed"
+    should check it.
     """
     try:
         with open(os.devnull, "r") as devnull:
-            r = subprocess.run(
-                cmd,
-                stdin=devnull,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                close_fds=True,
-            )
-        return r.stdout, r.stderr
+            r = subprocess.run(cmd, stdin=devnull, timeout=timeout, cwd=cwd,
+                               **_SUBPROCESS_KW)
+        err = r.stderr
+        if r.returncode != 0 and not err.strip():
+            err = f"{cmd[0]} exited with status {r.returncode}"
+        return r.stdout, err
     except Exception as e:
-        return "", str(e)
+        return "", str(e) or type(e).__name__
 
 def run_out(cmd: list[str]) -> str:
     return run(cmd)[0]
@@ -508,38 +532,67 @@ def sacct_final_state(jobids: list[str]) -> dict[str, str]:
         if len(parts) < 2:
             continue
         raw_jid   = parts[0].strip()
-        raw_state = parts[1].strip().split()[0].upper()
-        if not raw_jid or not raw_state:
+        words     = parts[1].strip().split()      # "CANCELLED by 1234"
+        if not raw_jid or not words:
             continue
-        # Normalise "123.batch" → "123", "123_4" → "123"
-        base = raw_jid.split(".")[0]
-        if "_" in base:
-            base = base.split("_")[0]
-        state = _aliases.get(raw_state, raw_state)
-        cur = best.get(base)
-        if cur is None or _priority.get(state, 0) > _priority.get(cur, 0):
-            best[base] = state
+        state = words[0].upper()
+        state = _aliases.get(state, state)
+        # Steps fold into their job ("123.batch" → "123", "123_4.0" → "123_4").
+        # An array task is also folded into its array ("123_4" → "123") so
+        # that asking about the array as a whole still gets an answer, but
+        # each task keeps its own entry: a failed task must not be reported
+        # with the state of its siblings.
+        job = raw_jid.split(".")[0]
+        keys = {job, job.split("_")[0]}
+        for key in keys:
+            cur = best.get(key)
+            if cur is None or _priority.get(state, 0) > _priority.get(cur, 0):
+                best[key] = state
 
     return {jid: best[jid] for jid in jobids if jid in best}
 
 
-def parse_squeue() -> list[dict]:
+def gres_gpu_count(gres: str) -> int:
+    """Total GPUs in a Gres string, summed over comma-separated entries.
+
+    Spellings seen in squeue %b and scontrol: "gpu:4", "gres/gpu:4",
+    "gres:gpu:4", "gpu:a100:4", "gpu:a100:4(IDX:0-3)", and "gpu" or
+    "gpu:a100" with no count (which means one).  The optional middle part is
+    the GPU model, whose own digits ("a100") must not be read as the count.
+    """
+    total = 0
+    for item in (gres or "").split(","):
+        item = item.split("(")[0].strip()
+        m = re.search(r"(?:^|[/:])gpu(?::(.*))?$", item, re.IGNORECASE)
+        if not m:
+            continue
+        count = re.fullmatch(r"(?:[^:]+:)?(\d+)", m.group(1) or "")
+        total += int(count.group(1)) if count else 1
+    return total
+
+
+def parse_squeue() -> list[dict] | None:
+    """Jobs currently in the queue, or None if squeue itself failed.
+
+    None and [] mean very different things to the refresh loop: an empty
+    queue finishes every tracked job, while a timed-out squeue says nothing
+    about them at all.
+    """
     # %j (job name) is deliberately LAST: Slurm allows "|" inside a job name,
     # and an unbounded split would then shift every following field (the user
     # column in particular, which the cancel/hold guards rely on).
     # split("|", 11) keeps the remainder — the full name — in the last element.
     fmt = "%i|%P|%u|%T|%M|%L|%C|%m|%b|%R|%N|%j"
-    out = run_out(["squeue", f"--format={fmt}", "--noheader"])
+    out, err = run(["squeue", f"--format={fmt}", "--noheader"])
+    if err.strip() and not out.strip():
+        return None
     jobs = []
     for line in out.strip().splitlines():
         parts = line.split("|", 11)
         if len(parts) < 12:
             continue
-        raw_gpu = parts[8]
-        gpu_val = ""
-        m = re.search(r"\d+", raw_gpu)
-        if m and "gpu" in raw_gpu.lower():
-            gpu_val = m.group()
+        gpus = gres_gpu_count(parts[8])
+        gpu_val = str(gpus) if gpus else ""
         jobs.append({
             "jobid":     parts[0],
             "partition": parts[1],
@@ -653,11 +706,33 @@ def compute_stats(jobs: list[dict]) -> dict:
     return {"total": total, "mine": len(mine),
             "by_state": dict(by_state), "running_gpus": running_gpus}
 
+def scontrol_field(text: str, key: str) -> str:
+    """Value of `Key=` in `scontrol show job` output, spaces included.
+
+    scontrol prints several Key=Value pairs per line, so a value runs until
+    the next " Key=" or the end of the line.  Matching with \\S+ (as this used
+    to) cut "JobName=my run" to "my" and broke paths containing spaces.
+
+    The job name is free text chosen by whoever submitted the job and is
+    printed first ("JobId=1 JobName=..."), so a name such as
+    "x StdOut=/tmp/evil UserId=bob(1)" would spoof the fields after it.
+    Hence JobName is read as the rest of its own line, and every other key
+    takes its *last* occurrence, which is always the genuine one.
+    """
+    text = text or ""
+    if key == "JobName":
+        m = re.search(r"^\s*JobId=\S+\s+JobName=(.*)$", text, re.MULTILINE)
+        return m.group(1).strip() if m else ""
+    matches = re.findall(
+        rf"(?:^|\s){re.escape(key)}=(.*?)(?=\s+[A-Za-z][\w:/]*=|$)",
+        text, re.MULTILINE)
+    return matches[-1].strip() if matches else ""
+
+
 def get_job_log_paths(jobid: str) -> dict[str, str]:
     out = run_out(["scontrol", "show", "job", jobid]) if is_valid_jobid(jobid) else ""
     def extract(key: str) -> str:
-        m = re.search(rf"{key}=(\S+)", out)
-        return m.group(1) if m else ""
+        return scontrol_field(out, key)
 
     raw_stdout  = extract("StdOut")
     raw_stderr  = extract("StdErr")
@@ -683,71 +758,70 @@ def get_job_log_paths(jobid: str) -> dict[str, str]:
         "raw":     out,
     }
 
-def tail_file(path: str, n: int = LOG_TAIL_LINES) -> str:
+# How much of a log is read when (re)starting a tail.  Far more than
+# LOG_TAIL_LINES of any sane log, and small enough to never stall the UI.
+_TAIL_WINDOW_BYTES = 512 * 1024
+
+
+def open_regular_file(path: str):
+    """Open `path` for binary reading, refusing anything but a regular file.
+
+    Log paths come from other users' job records, so they may name a FIFO
+    (open() would block the reading thread forever) or a device such as
+    /dev/zero (a read would never end).  O_NONBLOCK makes opening a FIFO
+    return at once so that fstat can reject it.
     """
-    Read the last n lines of a file using pure Python (no subprocess).
-    Avoids BlockingIOError from inherited O_NONBLOCK stdin in Textual.
-    """
-    if not path:
-        return "(No path available)"
-    if not os.path.exists(path):
-        return f"(File not found: {path})"
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
-        # Efficient tail: read from end using binary seek
-        with open(path, "rb") as f:
-            # Get file size
-            f.seek(0, 2)
-            size = f.tell()
-            if size == 0:
-                return "(File is empty)"
-            # Read last chunk (max 512KB) to find last n lines
-            chunk = min(size, 512 * 1024)
-            f.seek(-chunk, 2)
-            data = f.read()
-        lines = data.decode("utf-8", errors="replace").splitlines()
-        # Seeking to a fixed offset usually lands mid-line; that first
-        # fragment is not a real line, so drop it (unless we read the
-        # whole file, in which case every line is complete).
-        if chunk < size and lines:
-            lines = lines[1:]
-        return "\n".join(lines[-n:])
-    except Exception as e:
-        return f"(Error reading file: {e})"
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def follow_file(path: str, offset: int = 0,
                 max_lines: int = LOG_TAIL_LINES) -> tuple[list[str], int, bool]:
     """Incremental tail: read only what was appended since `offset`.
 
-    Returns (complete_new_lines, new_offset, reset).  `reset` means the caller
-    should discard what it had — either this is the first read or the file was
-    truncated/rotated underneath us.  A trailing partial line is deliberately
-    left unconsumed so it is returned whole on the next call.
+    Returns (new_lines, new_offset, reset).  `reset` means the caller should
+    discard what it had and show `new_lines` instead: this is the first read,
+    the file was truncated/rotated, or so much was appended since the last
+    read that it is re-tailed rather than loaded whole.
+
+    On an incremental read a trailing partial line is left unconsumed, so it
+    comes back whole on the next call.  A fresh tail does include it — a
+    finished job's log need not end in a newline.
     """
     if not path or not os.path.exists(path):
         return ([], 0, False)
     try:
-        size = os.path.getsize(path)
-        if offset > size:          # truncated or rotated
-            offset = 0
-        if offset <= 0:
-            text = tail_file(path, max_lines)
-            if text.startswith("(") and not os.path.getsize(path):
-                return ([], size, True)
-            return (text.splitlines(), size, True)
-        if size == offset:
-            return ([], offset, False)
-        with open(path, "rb") as f:
-            f.seek(offset)
-            data = f.read(size - offset)
-        cut = data.rfind(b"\n")
-        if cut == -1:
-            return ([], offset, False)      # no complete line yet
-        chunk = data[: cut + 1]
-        lines = chunk.decode("utf-8", errors="replace").splitlines()
-        return (lines, offset + len(chunk), False)
-    except Exception:
+        with open_regular_file(path) as f:
+            # Size and data come from the same handle, so a log that grows
+            # between the two can neither be skipped nor read twice.
+            size = os.fstat(f.fileno()).st_size
+            reset = offset <= 0 or offset > size or size - offset > _TAIL_WINDOW_BYTES
+            start = max(0, size - _TAIL_WINDOW_BYTES) if reset else offset
+            f.seek(start)
+            data = f.read(size - start)
+    except OSError:
         return ([], offset, False)
+
+    if reset:
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        # A window that starts mid-file usually starts mid-line; that first
+        # fragment is not a real line.
+        if start > 0 and lines:
+            lines = lines[1:]
+        return (lines[-max_lines:], size, True)
+
+    cut = data.rfind(b"\n")
+    if cut == -1:
+        return ([], offset, False)          # no complete line yet
+    chunk = data[: cut + 1]
+    lines = chunk.decode("utf-8", errors="replace").splitlines()
+    return (lines, offset + len(chunk), False)
 
 
 # ──────────────────────────────────────────────
@@ -758,8 +832,11 @@ def get_job_nodes(jobid: str) -> list[str]:
     if not is_valid_jobid(jobid):
         return []
     out = run_out(["squeue", "-j", jobid, "-h", "--format=%N"])
-    nodelist = out.strip()
-    if not nodelist or nodelist in ("(None)", "N/A", ""):
+    # An array job prints one line per task; scontrol takes one
+    # comma-separated hostlist expression.
+    nodelist = ",".join(line.strip() for line in out.splitlines()
+                        if line.strip() not in ("", "(None)", "N/A"))
+    if not nodelist:
         return []
     try:
         exp = run_out(["scontrol", "show", "hostnames", nodelist])
@@ -792,9 +869,7 @@ def ssh_cmd(node: str, cmd: str, timeout: int | None = None) -> str:
                  "-o", "ConnectTimeout=5",
                  "-o", "BatchMode=yes",
                  "--", node, cmd],
-                stdin=devnull,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=timeout, close_fds=True,
+                stdin=devnull, timeout=timeout, **_SUBPROCESS_KW,
             )
         return r.stdout
     except Exception:
@@ -830,14 +905,32 @@ def get_node_gpu_info(node: str) -> list[dict]:
             continue
     return gpus
 
+def _cpu_busy_pct(first: str, second: str) -> int:
+    """CPU utilisation between two "cpu  user nice system idle iowait ..."
+    lines of /proc/stat.  Idle time is idle + iowait (fields 4 and 5)."""
+    try:
+        a = [int(x) for x in first.split()[1:]]
+        b = [int(x) for x in second.split()[1:]]
+    except ValueError:
+        return 0
+    if len(a) < 5 or len(a) != len(b):
+        return 0
+    total = sum(b) - sum(a)
+    idle = (b[3] + b[4]) - (a[3] + a[4])
+    return int(round(100 * (total - idle) / total)) if total > 0 else 0
+
+
 def get_node_cpu_mem(node: str) -> dict:
     """
-    Fetches CPU%, memory and load for a node via /proc.
+    Fetches CPU%, memory and load for a node via /proc in one SSH round trip.
     Works without nvidia-smi — only SSH access required.
+
+    CPU% comes from two /proc/stat samples half a second apart.  It used to
+    be scraped from `top` by column position, which reads an idle node
+    ("ni,100.0 id") as 100% busy.
     """
     cmd = (
-        "awk '/^cpu / {u=$2+$4; t=$2+$3+$4+$5+$6+$7+$8; "
-        "printf \"cpu_busy=%d cpu_total=%d\\n\", u, t}' /proc/stat; "
+        "grep '^cpu ' /proc/stat; sleep 0.5; grep '^cpu ' /proc/stat; "
         "awk '/^MemTotal/ {t=$2} /^MemAvailable/ {a=$2} "
         "END {printf \"mem_total=%d mem_avail=%d\\n\", t, a}' /proc/meminfo; "
         "uptime | awk -F\"load average:\" '{print \"load=\"$2}'"
@@ -845,11 +938,11 @@ def get_node_cpu_mem(node: str) -> dict:
     out = ssh_cmd(node, cmd)
     result = {"cpu_pct": 0, "mem_total_kb": 0, "mem_used_kb": 0,
               "mem_pct": 0, "load": "N/A"}
+    cpu_samples = [l for l in out.splitlines() if l.startswith("cpu ")]
+    if len(cpu_samples) >= 2:
+        result["cpu_pct"] = _cpu_busy_pct(cpu_samples[0], cpu_samples[1])
     for line in out.strip().splitlines():
         line = line.strip()
-        if line.startswith("cpu_busy="):
-            # Second read to compute delta (approx with a sleep)
-            pass
         if line.startswith("mem_total="):
             # split("=", 1): a token like "a=b=c" would otherwise raise
             # ValueError here and kill the whole monitor worker.
@@ -864,14 +957,6 @@ def get_node_cpu_mem(node: str) -> dict:
             result["mem_pct"] = int((mt - ma) / mt * 100) if mt > 0 else 0
         if line.startswith("load="):
             result["load"] = line[5:].strip().split(",")[0].strip()
-    # CPU% via top -bn1 (mpstat is not available everywhere)
-    cpu_out = ssh_cmd(node,
-        "top -bn2 -d0.2 | grep '^%Cpu' | tail -1 | "
-        "awk '{print 100-$8}' 2>/dev/null || echo 0")
-    try:
-        result["cpu_pct"] = int(float(cpu_out.strip()))
-    except (ValueError, TypeError):
-        result["cpu_pct"] = 0
     return result
 
 def get_job_sstat(jobid: str) -> dict:
@@ -881,38 +966,22 @@ def get_job_sstat(jobid: str) -> dict:
     result = {"avg_cpu": "N/A", "max_rss": "N/A", "tasks": "N/A"}
     if not is_valid_jobid(jobid):
         return result
+    # -P: an empty column would otherwise shift every field after it.
     out = run_out([
-        "sstat", "-j", jobid, "--noheader",
+        "sstat", "-j", jobid, "--noheader", "-P",
         "--format=AveCPU,MaxRSS,MaxVMSize,NTasks"
     ])
     line = out.strip().splitlines()[0] if out.strip() else ""
-    if line:
-        parts = line.split()
-        if len(parts) >= 3:
-            result["avg_cpu"] = parts[0]
-            result["max_rss"] = parts[1]
-            result["tasks"]   = parts[3] if len(parts) > 3 else "N/A"
+    parts = line.split("|")
+    if len(parts) >= 4:
+        result["avg_cpu"] = parts[0] or "N/A"
+        result["max_rss"] = parts[1] or "N/A"
+        result["tasks"]   = parts[3] or "N/A"
     return result
 
 def parse_time_to_secs(t: str) -> int:
-    """Convert a Slurm time string (DD-HH:MM:SS or HH:MM:SS or MM:SS) to seconds."""
-    t = t.strip()
-    if t in ("UNLIMITED", "N/A", ""):
-        return 0
-    days = 0
-    if "-" in t:
-        d, t = t.split("-", 1)
-        try: days = int(d)
-        except ValueError: pass
-    parts = t.split(":")
-    try:
-        if len(parts) == 3:
-            return days*86400 + int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-        elif len(parts) == 2:
-            return days*86400 + int(parts[0])*60 + int(parts[1])
-    except ValueError:
-        pass
-    return 0
+    """Whole seconds in a squeue time string ("1-02:03:04", "05:06", ...)."""
+    return int(parse_slurm_duration(t))
 
 def make_bar(pct: int, width: int = 20, fill: str = "█", empty: str = "░") -> str:
     """Generate an ASCII progress bar."""
@@ -929,55 +998,60 @@ def bar_color(pct: int) -> str:
 # ──────────────────────────────────────────────
 #  JOB RERUN / RESUBMIT
 # ──────────────────────────────────────────────
-def get_submit_line(jobid: str) -> str:
-    """
-    Tries to recover the original submit line from multiple sources:
-    1. sacct --format=SubmitLine  (available on clusters with full accounting)
-    2. scontrol show job Command= (available while the job exists in Slurm)
-    Returns the .sh script path or the full sbatch line, or "" if not found.
-    """
-    if not is_valid_jobid(jobid):
-        return ""
-    # Source 1: sacct SubmitLine
-    try:
-        out = run_out(["sacct", "-j", jobid, "-X", "-n", "-P", "--format=SubmitLine"])
-        for line in out.splitlines():
-            line = line.strip()
-            if line and line not in ("SubmitLine", "Unknown", "N/A", ""):
-                return line
-    except Exception:
-        pass
+def get_rerun_source(jobid: str) -> dict:
+    """Everything needed to resubmit a job, as a dict with keys:
 
-    # Source 2: scontrol show job -> Command= field
-    try:
-        out = run_out(["scontrol", "show", "job", jobid])
-        m = re.search(r"Command=(\S+)", out)
-        if m:
-            script = m.group(1)
-            if script and script != "(null)" and os.path.isfile(script):
-                return f"sbatch {shlex.quote(script)}"
-    except Exception:
-        pass
+      user         who submitted it — a rerun runs the command as *you*
+      workdir      directory it was submitted from
+      submit_line  the original command line ("" when unknown)
+      script       batch script path from scontrol ("" when unknown)
 
-    return ""
-
-def get_job_script_info(jobid: str) -> dict:
+    sacct is asked first (SubmitLine needs Slurm 20.11+ with accounting;
+    older versions reject the field, so it is retried without it).  scontrol
+    fills the gaps but only knows jobs still in the controller's memory.
     """
-    Extract Command and WorkDir from scontrol show job
-    to allow building an sbatch command manually.
-    """
-    info = {"command": "", "workdir": "", "extra": ""}
+    info = {"user": "", "workdir": "", "submit_line": "", "script": ""}
     if not is_valid_jobid(jobid):
         return info
-    try:
-        out = run_out(["scontrol", "show", "job", jobid])
-        m_cmd  = re.search(r"Command=(\S+)", out)
-        m_work = re.search(r"WorkDir=(\S+)", out)
-        if m_cmd:  info["command"] = m_cmd.group(1)
-        if m_work: info["workdir"] = m_work.group(1)
-    except Exception:
-        pass
+
+    # SubmitLine goes last: it is free text and may itself contain "|".
+    for fmt in ("User,WorkDir,SubmitLine", "User,WorkDir"):
+        out, err = run(["sacct", "-j", jobid, "-X", "-n", "-P", f"--format={fmt}"])
+        if err.strip() and not out.strip():
+            continue
+        line = next((l for l in out.splitlines() if l.strip()), "")
+        parts = line.split("|", 2)
+        if len(parts) >= 2:
+            info["user"], info["workdir"] = parts[0].strip(), parts[1].strip()
+        if len(parts) == 3 and parts[2].strip() not in ("Unknown", "N/A"):
+            info["submit_line"] = parts[2].strip()
+        break
+
+    out = run_out(["scontrol", "show", "job", jobid])
+    if out.strip():
+        info["user"] = info["user"] or scontrol_field(out, "UserId").split("(")[0]
+        info["workdir"] = info["workdir"] or scontrol_field(out, "WorkDir")
+        script = scontrol_field(out, "Command")
+        if script and script != "(null)":
+            info["script"] = script
+    if not info["submit_line"] and info["script"] and os.path.isfile(info["script"]):
+        info["submit_line"] = f"sbatch {shlex.quote(info['script'])}"
     return info
+
+
+def check_rerun_owner(jobid: str, owner: str) -> str:
+    """Why `jobid` may not be rerun by this user, or "" if it may.
+
+    Resubmitting replays the recovered command line under *your* account,
+    so another user's job (whose SubmitLine could be anything, --wrap
+    included) is refused, as is a job whose owner cannot be established.
+    """
+    if not owner:
+        return f"Cannot tell who submitted job {jobid}; refusing to rerun it"
+    if owner != MY_USER:
+        return f"Job {jobid} belongs to {owner}; only your own jobs can be rerun"
+    return ""
+
 
 def build_sbatch_args(submit_line: str) -> list[str] | None:
     """Turn a recovered submit line into a safe argv for sbatch.
@@ -999,52 +1073,69 @@ def build_sbatch_args(submit_line: str) -> list[str] | None:
     return ["sbatch"] + args[1:]
 
 
-def run_sbatch(args: list[str]) -> tuple[bool, str]:
-    """Launch sbatch with the given args. Returns (ok, message)."""
+def run_sbatch(args: list[str], cwd: str | None = None) -> tuple[bool, str]:
+    """Launch sbatch with the given args. Returns (ok, message).
+
+    `cwd` is the directory to submit from.  A recovered submit line usually
+    names its script relatively ("sbatch job.sh") and the job inherits
+    sbatch's working directory, so a rerun must start from the original
+    WorkDir rather than wherever the dashboard happens to run.
+    """
+    if cwd and not os.path.isdir(cwd):
+        return False, f"Original working directory no longer exists: {cwd}"
     try:
         with open(os.devnull, "r") as devnull:
-            proc = subprocess.run(
-                args, stdin=devnull, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True, timeout=30,
-                close_fds=True,
-            )
+            proc = subprocess.run(args, stdin=devnull, timeout=30, cwd=cwd or None,
+                                  **_SUBPROCESS_KW)
         if proc.returncode == 0:
             return True, proc.stdout.strip() or "Job resubmitted"
         return False, proc.stderr.strip() or "sbatch unknown error"
     except Exception as e:
         return False, str(e)
 
-def rerun_history_job(jobid: str) -> tuple[bool, str]:
-    """
-    Multi-source strategy to resubmit a job:
-      1. sacct SubmitLine -> sbatch <original line>
-      2. scontrol Command= -> sbatch <script>
-      3. scontrol requeue  -> back to PENDING (only jobs still in Slurm)
+
+def rerun_history_job(jobid: str, cached_line: str = "",
+                      known_owner: str = "") -> tuple[bool, str, str]:
+    """Resubmit a finished job.  Returns (ok, message, submit_line_used).
+
+    Tried in order:
+      1. the original submit line from sacct/scontrol, then `cached_line`
+         (the one remembered in the history file), run from the original
+         working directory;
+      2. `scontrol requeue`, for jobs Slurm still remembers.
+
+    `known_owner` (the user recorded in history) is only used when neither
+    sacct nor scontrol can say who submitted the job.
     """
     if not is_valid_jobid(jobid):
-        return False, f"Invalid job id: {jobid!r}"
+        return False, f"Invalid job id: {jobid!r}", ""
+    src = get_rerun_source(jobid)
+    refusal = check_rerun_owner(jobid, src["user"] or known_owner)
+    if refusal:
+        return False, refusal, ""
 
-    # Strategy 1 + 2: get_submit_line already combines both sources
-    submit_line = get_submit_line(jobid)
-    if submit_line:
-        args = build_sbatch_args(submit_line)
-        if args:
-            return run_sbatch(args)
+    errors: list[str] = []
+    # dict.fromkeys: try each distinct line once, in order.
+    for line in dict.fromkeys(l for l in (src["submit_line"], cached_line) if l):
+        args = build_sbatch_args(line)
+        if not args:
+            errors.append(f"Not an sbatch command: {line!r}")
+            continue
+        ok, msg = run_sbatch(args, cwd=src["workdir"] or None)
+        if ok:
+            return True, msg, line
+        errors.append(f"sbatch: {msg}")
 
-    # Strategy 3: scontrol requeue
-    # run() keeps stdin off the terminal and never raises on timeout /
-    # missing binary, unlike the bare subprocess.run() this used to be.
     _, req_err = run(["scontrol", "requeue", jobid], timeout=20)
     if not req_err.strip():
-        return True, f"Job {jobid} requeued → back to PENDING"
+        return True, f"Job {jobid} requeued → back to PENDING", ""
+    errors.append(f"requeue: {req_err.strip()}")
 
-    return False, (
-        "Could not resubmit the job. Possible causes:\n"
-        "· sacct has no SubmitLine (cluster accounting config)\n"
-        "· The job no longer exists in scontrol (too old)\n"
-        "· You lack requeue permissions\n"
-        "Fix: submit manually with sbatch <your_script.sh>"
-    )
+    if not src["submit_line"] and not cached_line:
+        errors.insert(0, "sacct/scontrol did not return the original submit line")
+    hint = f"\nScript: {src['script']}" if src["script"] else ""
+    return False, ("Could not resubmit automatically.\n" + "\n".join(errors)
+                   + "\nSubmit it manually: sbatch <your_script.sh>" + hint), ""
 
 # ──────────────────────────────────────────────
 #  HISTORY ANALYTICS
@@ -1147,10 +1238,15 @@ def get_partitions() -> list[str]:
     except Exception:
         return list(DEFAULT_PARTITIONS)
 
-# Tokens that Slurm expands in the log file name
-_SLURM_TOKENS = re.compile(r'%[jJuUxXaAnNtT]')
+# Filename patterns Slurm expands in --output/--error (see sbatch(1)).
+# An optional width zero-pads a number: "%4a" → "0007".  "%%" is a literal %.
+_SLURM_TOKENS = re.compile(r"%(\d*)([%AabJjNnstux])")
 
-# ── Slurm log-path resolver  (%J = jobid.stepid variant) ──────────────────
+
+def has_slurm_tokens(text: str) -> bool:
+    """True if `text` contains a filename pattern Slurm would expand."""
+    return any(m.group(2) != "%" for m in _SLURM_TOKENS.finditer(text or ""))
+
 
 def _split_array_jobid(jobid: str) -> tuple:
     jid = str(jobid).strip()
@@ -1169,6 +1265,9 @@ def _expand_slurm_log_candidates(
     """
     Returns a list of concrete paths by expanding all Slurm filename tokens.
     For %J (jobid.stepid) multiple candidates are tried in order.
+
+    For an array task Slurm's %j is the task's own numeric job id, which
+    history does not record; "123_4" is the best available stand-in.
     """
     if not pattern:
         return []
@@ -1177,37 +1276,38 @@ def _expand_slurm_log_candidates(
     jid_full   = str(jobid).strip()
     jid_master, jid_task = _split_array_jobid(jid_full)
 
-    base_subs = {
-        "%%": "%",
-        "%j": jid_full,
-        "%A": jid_master,
-        "%a": jid_task or "0",
-        "%u": username or os.environ.get("USER", ""),
-        "%x": job_name or "",
-        "%N": "",  # first node – unknown here, skip
-        "%n": "0",
-        "%s": "batch",
-        "%t": "0",
+    values = {
+        "j": jid_full,
+        "A": jid_master,
+        "a": jid_task or "0",
+        "b": str(int(jid_task) % 10) if jid_task.isdigit() else "0",
+        "u": username or os.environ.get("USER", ""),
+        "x": job_name or "",
+        "N": "",  # first node – unknown here, skip
+        "n": "0",
+        "s": "batch",
+        "t": "0",
     }
 
-    j_variants = [
-        f"{jid_full}.0",
-        f"{jid_full}.batch",
-        jid_full,
-    ] if "%J" in pattern else [""]
+    def expand(j_value: str) -> str:
+        def sub(m: re.Match) -> str:
+            width, token = m.groups()
+            if token == "%":
+                return "%"
+            value = j_value if token == "J" else values[token]
+            return value.zfill(int(width)) if width and value.isdigit() else value
+        # One pass, so "%%j" stays a literal "%j" rather than being expanded.
+        return _SLURM_TOKENS.sub(sub, pattern)
 
-    seen: set = set()
+    j_variants = [f"{jid_full}.0", f"{jid_full}.batch", jid_full]
+    if not any(m.group(2) == "J" for m in _SLURM_TOKENS.finditer(pattern)):
+        j_variants = [""]
+
     out: list = []
     for jv in j_variants:
-        p = pattern
-        for token, value in base_subs.items():
-            p = p.replace(token, value)
-        p = p.replace("%J", jv)
-        p = os.path.normpath(p)
-        if p and p not in seen:
-            seen.add(p)
+        p = os.path.normpath(expand(jv))
+        if p and p not in out:
             out.append(p)
-
     return out
 
 
@@ -1222,10 +1322,9 @@ def resolve_existing_slurm_log(
     first path that actually exists on disk.  Falls back to the first candidate
     (already expanded) when nothing exists yet, so the viewer can at least try.
     """
-    if not pattern:
-        return ""
-    if not _SLURM_TOKENS.search(pattern):
-        return pattern  # no tokens – return as-is
+    pattern = str(pattern or "")
+    if "%" not in pattern:
+        return pattern
 
     candidates = _expand_slurm_log_candidates(pattern, jobid, job_name, username)
     for p in candidates:
@@ -1235,64 +1334,57 @@ def resolve_existing_slurm_log(
     return candidates[0] if candidates else pattern
 
 
-
 def _safe_log_path(raw: str, script: str) -> tuple[str, str]:
     """
     Given the log path written by the user, returns:
-      - log_path : safe path to pass to --output/--error
-      - dir_to_create : base directory to create before sbatch
+      - log_path      : absolute path to pass to --output/--error
+      - dir_to_create : its directory, created before sbatch runs
 
     Rules:
-      * %j/%J/%u/etc. are valid ONLY in the file name,
-        never in a directory component.
-      * If the user put a token in the directory (e.g. logs/%j/out.log),
-        we flatten it to logs/out.%j.log so Slurm expands it correctly.
-      * If the path is relative, it is made relative to the script workdir.
+      * "~" is expanded here: sbatch is run without a shell.
+      * A relative path is made relative to the script's directory.
+      * %j/%x/... are valid only in the file name.  Slurm never creates
+        directories for --output, so "logs/%j/out.log" would make the job
+        fail at start; it is rejected with ValueError instead.
     """
     if not raw:
         return raw, ""
 
-    raw = raw.strip()
-
-    # If relative, make absolute using the script directory
-    if not raw.startswith("/"):
+    raw = os.path.expanduser(raw.strip())
+    if not os.path.isabs(raw):
         base = os.path.dirname(os.path.abspath(script)) if script else os.getcwd()
         raw = os.path.join(base, raw)
+    raw = os.path.normpath(raw)
 
     parent = os.path.dirname(raw)
-    fname  = os.path.basename(raw)
-
-    # For paths with Slurm tokens in directory components (e.g. .../%J/out.txt),
-    # keep the pattern intact so Slurm expands it correctly at submit time.
-    # resolve_existing_slurm_log() will find the actual file when opening logs.
-    # dir_to_create = deepest static ancestor that contains no tokens.
-    log_path = os.path.join(parent, fname)
-
-    # Walk down until we hit the first directory component holding a token:
-    # everything above it is static and can safely be created ahead of sbatch.
-    parts_list = list(Path(parent).parts)
-    clean_parts = []
-    for p in parts_list:
-        if _SLURM_TOKENS.search(p):
-            break
-        clean_parts.append(p)
-    static_parent = str(Path(*clean_parts)) if clean_parts else os.sep
-
-    return log_path, static_parent
+    if has_slurm_tokens(parent):
+        raise ValueError(
+            f"Slurm patterns (%j, %x, ...) can only go in the file name, "
+            f"not in a directory: {raw}")
+    return raw, parent
 
 
 def submit_job(template: dict) -> tuple[bool, str]:
-    script = template.get("script", "")
+    script = os.path.expanduser(template.get("script", "").strip())
     if not script:
         return False, "No script specified"
+    # Absolute: sbatch runs without a shell from the dashboard's directory,
+    # and a name starting with "-" would otherwise be read as an option.
+    script = os.path.abspath(script)
 
     # Resolve and sanitise log paths BEFORE calling sbatch
-    out_raw = template.get("output", "")
-    err_raw = template.get("error", "")
-    out_path, out_dir = _safe_log_path(out_raw, script)
-    err_path, err_dir = _safe_log_path(err_raw, script)
+    try:
+        out_path, out_dir = _safe_log_path(template.get("output", ""), script)
+        err_path, err_dir = _safe_log_path(template.get("error", ""), script)
+    except ValueError as e:
+        return False, str(e)
 
-    # Create base directories (no tokens) so Slurm can write
+    try:
+        extra = shlex.split(template.get("extra", ""))
+    except ValueError as e:         # unbalanced quotes
+        return False, f"Could not parse extra args: {e}"
+
+    # Create the log directories so Slurm can write there.
     for d in (out_dir, err_dir):
         if d:
             try:
@@ -1312,9 +1404,7 @@ def submit_job(template: dict) -> tuple[bool, str]:
     if template.get("account"):   args += [f"--account={template['account']}"]
     if out_path: args += [f"--output={out_path}"]
     if err_path: args += [f"--error={err_path}"]
-    if template.get("extra"):
-        for tok in shlex.split(template["extra"]):
-            args.append(tok)
+    args += extra
     args.append(script)
     return run_sbatch(args)
 
@@ -1353,19 +1443,14 @@ def get_dependency_tree(jobid: str, depth: int = 0, visited: set = None) -> list
     if jobid in visited or depth > 5 or not is_valid_jobid(jobid):
         return []
     visited.add(jobid)
-    try:
-        out = run_out(["scontrol", "show", "job", jobid])
-        m_state = re.search(r"JobState=(\S+)", out)
-        m_dep   = re.search(r"Dependency=(\S+)", out)
-        m_name  = re.search(r"JobName=(\S+)", out)
-        state   = m_state.group(1) if m_state else "UNKNOWN"
-        dep_str = m_dep.group(1)   if m_dep   else "(none)"
-        name    = m_name.group(1)  if m_name  else ""
-    except Exception:
-        return [(depth, jobid, "UNKNOWN", "(none)", "")]
+    out = run_out(["scontrol", "show", "job", jobid])
+    state   = scontrol_field(out, "JobState") or "UNKNOWN"
+    dep_str = scontrol_field(out, "Dependency") or "(none)"
+    name    = scontrol_field(out, "JobName")
     result = [(depth, jobid, state, dep_str, name)]
     if dep_str and dep_str not in ("(null)", "(none)"):
-        for dep in dep_str.split(","):
+        # "," separates AND clauses and "?" separates OR clauses.
+        for dep in re.split(r"[,?]", dep_str):
             # Slurm writes "afterok:12:13" for several ids on one clause, and
             # also uses aftercorr/afterburstbuffer — the old pattern matched
             # only the first id of the four "after*" types it knew about.
@@ -1472,7 +1557,8 @@ def parse_slurm_duration(t: str) -> float:
     if not t or t.upper() in ("UNLIMITED", "N/A", "INVALID", "UNKNOWN", "NONE"):
         return 0.0
     days = 0
-    if "-" in t:
+    has_days = "-" in t
+    if has_days:
         d, _, t = t.partition("-")
         try:
             days = int(d)
@@ -1483,14 +1569,15 @@ def parse_slurm_duration(t: str) -> float:
         nums = [float(x) for x in parts]
     except ValueError:
         return 0.0
-    if len(parts) == 3:
-        h, m, s = nums
-    elif len(parts) == 2:
-        h, m, s = 0.0, nums[0], nums[1]
-    elif len(parts) == 1:
-        h, m, s = 0.0, 0.0, nums[0]
-    else:
+    if len(nums) > 3:
         return 0.0
+    # With a "D-" prefix the fields count from hours ("1-12" is 1 day 12 h,
+    # "1-12:30" adds 30 min); without one they count back from seconds.
+    if has_days:
+        nums += [0.0] * (3 - len(nums))
+    else:
+        nums = [0.0] * (3 - len(nums)) + nums
+    h, m, s = nums
     return days * 86400 + h * 3600 + m * 60 + s
 
 
@@ -1832,13 +1919,6 @@ def get_node_info_scontrol(node: str) -> dict:
     gres = fields.get("Gres", "") or ""
     gres_used = fields.get("GresUsed", "") or ""
 
-    def gpu_num(text):
-        # Gres spellings: "gpu:4", "gpu:a100:4", "gpu:a100:4(IDX:0-3)".
-        # The optional middle group is the GPU model, whose own digits
-        # ("a100") must not be mistaken for the count.
-        m = re.search(r"gpu:(?:[^,()\s:]+:)?(\d+)", text or "")
-        return int(m.group(1)) if m else 0
-
     return {
         "node":        node,
         "state":       fields.get("State", ""),
@@ -1851,8 +1931,8 @@ def get_node_info_scontrol(node: str) -> dict:
         "mem_alloc_mb": alloc_mem,
         "mem_free_mb":  free_mem,
         "mem_pct":     int(alloc_mem / real_mem * 100) if real_mem else 0,
-        "gpu_total":   gpu_num(gres),
-        "gpu_alloc":   gpu_num(gres_used),
+        "gpu_total":   gres_gpu_count(gres),
+        "gpu_alloc":   gres_gpu_count(gres_used),
         "reason":      fields.get("Reason", ""),
     }
 
@@ -1879,12 +1959,9 @@ def get_node_cotenants(node: str, exclude_jobid: str = "") -> list:
             continue
         if mine_base and jobid.split("_")[0].split(".")[0] == mine_base:
             continue
-        gpu = ""
-        m = re.search(r"\d+", gres or "")
-        if m and "gpu" in (gres or "").lower():
-            gpu = m.group()
+        gpus = gres_gpu_count(gres)
         others.append({"jobid": jobid, "user": user, "state": state,
-                       "cpus": cpus, "mem": mem, "gpus": gpu,
+                       "cpus": cpus, "mem": mem, "gpus": str(gpus) if gpus else "",
                        "elapsed": elapsed, "name": name[:24]})
     return others
 
@@ -2107,7 +2184,8 @@ def load_templates(path: Path | None = None) -> list[dict]:
             vals = entry.get("values", {})
             if isinstance(vals, dict):
                 out.append({"name": str(entry["name"]),
-                            "values": {k: str(v) for k, v in vals.items()
+                            "values": {k: "" if v is None else str(v)
+                                       for k, v in vals.items()
                                        if k in TEMPLATE_FIELDS}})
     return out
 
@@ -2142,6 +2220,14 @@ def upsert_template(templates: list[dict], name: str, values: dict) -> list[dict
 # ──────────────────────────────────────────────
 #  ARRAY RE-RUN
 # ──────────────────────────────────────────────
+# States in which a job is still alive in the queue.
+ACTIVE_STATES = {"R", "RUNNING", "PD", "PENDING", "CG", "COMPLETING",
+                 "S", "SUSPENDED", "PR", "PREEMPTED", "CF", "CONFIGURING",
+                 "RQ", "REQUEUED", "RS", "RESIZING"}
+
+# History states that a previous session may have left behind unresolved.
+STALE_HISTORY_STATES = ACTIVE_STATES | {"UNKNOWN", ""}
+
 TERMINAL_STATES = {"COMPLETED", "CD", "FAILED", "F", "TIMEOUT", "TO",
                    "CANCELLED", "CA", "OUT_OF_MEMORY", "OOM", "NODE_FAIL",
                    "NF", "PREEMPTED", "BOOT_FAIL", "DEADLINE"}
@@ -2232,15 +2318,19 @@ def build_array_rerun_args(submit_line: str, indices: list[int]) -> list[str] | 
     args = build_sbatch_args(submit_line)
     if not args or not indices:
         return None
+    # The script's position cannot be told reliably without knowing which
+    # sbatch options take a separate value ("-p gpu"), so --array is removed
+    # wherever it appears; a script argument spelled "-a…" would be lost too.
     cleaned, skip_next = [], False
     for tok in args[1:]:
         if skip_next:
             skip_next = False
             continue
-        if tok.startswith("--array=") or tok.startswith("-a="):
-            continue
         if tok in ("--array", "-a"):
             skip_next = True
+            continue
+        # "--array=1-9", "-a=1-9", and getopt's attached form "-a1-9".
+        if tok.startswith("--array=") or tok.startswith("-a"):
             continue
         cleaned.append(tok)
     return ["sbatch", f"--array={compact_indices(indices)}"] + cleaned
@@ -2371,12 +2461,12 @@ class SubmitJobModal(ModalScreen):
             return
         if not chosen:
             names = ", ".join(sorted(self._partitions))
-            hint.update(f"  Partitions: {names[:110]}")
+            hint.update(f"  Partitions: {escape_markup(names[:110])}")
             return
         p = self._partitions.get(chosen)
         if not p:
             close = [n for n in self._partitions if n.startswith(chosen)]
-            hint.update(f"  [{C.WARN}]Unknown partition '{chosen}'[/]"
+            hint.update(f"  [{C.WARN}]Unknown partition '{escape_markup(chosen)}'[/]"
                         + (f" — did you mean {', '.join(close[:4])}?" if close else ""))
             return
         bits = [f"MaxTime {p['max_time']}"]
@@ -2384,7 +2474,7 @@ class SubmitJobModal(ModalScreen):
         if p["def_mem_per_cpu"]:  bits.append(f"DefMem/CPU {p['def_mem_per_cpu']}M")
         if p["max_mem_per_node"]: bits.append(f"MaxMem/Node {p['max_mem_per_node']}M")
         bits.append(f"State {p['state']}")
-        hint.update(f"  [{C.PRIMARY}]{chosen}[/]: " + "  ·  ".join(bits))
+        hint.update(f"  [{C.PRIMARY}]{escape_markup(chosen)}[/]: " + "  ·  ".join(bits))
 
     def _get_values(self) -> dict:
         return {f: self.query_one(f"#si-{f}", Input).value.strip()
@@ -2420,10 +2510,12 @@ class SubmitJobModal(ModalScreen):
             if not vals.get("script"):
                 status.update(f"[bold {C.ERR}]✗ A script path is required[/]")
                 return
+            # sbatch runs without a shell, so "~" must be expanded here.
             script = os.path.expanduser(vals["script"])
             if not os.path.isfile(script):
-                status.update(f"[bold {C.ERR}]✗ Script not found: {script}[/]")
+                status.update(f"[bold {C.ERR}]✗ Script not found: {escape_markup(script)}[/]")
                 return
+            vals["script"] = script
             # sbatch has a 30 s timeout — running it inline froze the whole
             # TUI until the controller answered.
             status.update(f"[{C.FG_FAINT}]Submitting…[/]")
@@ -2437,7 +2529,7 @@ class SubmitJobModal(ModalScreen):
         templates = upsert_template(load_templates(), name, values)
         status = self.query_one("#submit-status", Label)
         if save_templates(templates):
-            status.update(f"[bold {C.OK}]✓ Template '{name}' saved[/]")
+            status.update(f"[bold {C.OK}]✓ Template '{escape_markup(name)}' saved[/]")
         else:
             status.update(f"[bold {C.ERR}]✗ Could not write {TEMPLATE_FILE}[/]")
 
@@ -2448,11 +2540,11 @@ class SubmitJobModal(ModalScreen):
         status = self.query_one("#submit-status", Label)
         if action == "load":
             self._set_values(entry["values"])
-            status.update(f"[bold {C.OK}]✓ Loaded template '{entry['name']}'[/]")
+            status.update(f"[bold {C.OK}]✓ Loaded template '{escape_markup(entry['name'])}'[/]")
         elif action == "delete":
             remaining = [t for t in load_templates() if t["name"] != entry["name"]]
             if save_templates(remaining):
-                status.update(f"[bold {C.WARN}]Template '{entry['name']}' deleted[/]")
+                status.update(f"[bold {C.WARN}]Template '{escape_markup(entry['name'])}' deleted[/]")
             else:
                 status.update(f"[bold {C.ERR}]✗ Could not update the template file[/]")
 
@@ -2462,16 +2554,31 @@ class SubmitJobModal(ModalScreen):
         self.app.call_from_thread(self._submit_done, vals, ok, msg)
 
     def _submit_done(self, vals: dict, ok: bool, msg: str) -> None:
+        if ok:
+            self.app.notify(f"Job submitted: {msg}", timeout=5, markup=False)
         if not self.is_attached:
+            # Closed while sbatch ran: the outcome must still be reported.
+            if ok:
+                self.app.refresh_data()
+            else:
+                self.app.notify(f"Submission failed: {msg}", severity="error",
+                                timeout=8, markup=False)
             return
         status = self.query_one("#submit-status", Label)
-        self.query_one("#btn-submit-run", Button).disabled = False
         if ok:
-            status.update(f"[bold {C.OK}]✓ Submitted: {msg}[/]")
-            self.app.notify(f"Job submitted: {msg}", timeout=5)
-            self.set_timer(2.0, lambda: self.dismiss(vals))
+            # The Submit button stays disabled: pressing it again during the
+            # pause below would submit the same job twice.
+            status.update(f"[bold {C.OK}]✓ Submitted: {escape_markup(msg)}[/]")
+            self.set_timer(2.0, lambda: self._dismiss_if_on_top(vals))
         else:
-            status.update(f"[bold {C.ERR}]✗ Error: {msg}[/]")
+            self.query_one("#btn-submit-run", Button).disabled = False
+            status.update(f"[bold {C.ERR}]✗ Error: {escape_markup(msg)}[/]")
+
+    def _dismiss_if_on_top(self, vals: dict) -> None:
+        # dismiss() pops the *top* screen; if a template dialog was opened
+        # meanwhile, wait until the user is back on this form.
+        if self.is_attached and self.app.screen is self:
+            self.dismiss(vals)
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -2584,43 +2691,62 @@ class ArrayJobModal(ModalScreen):
     @work(thread=True)
     def _worker_prepare_rerun(self) -> None:
         base = self._jobid.split("_")[0]
-        submit_line = get_submit_line(base)
-        args = build_array_rerun_args(submit_line, self._failed) if submit_line else None
-        self.app.call_from_thread(self._confirm_rerun, args, submit_line)
+        src = get_rerun_source(base)
+        self.app.call_from_thread(self._confirm_rerun, base, src)
 
-    def _confirm_rerun(self, args: list[str] | None, submit_line: str) -> None:
+    def _confirm_rerun(self, base: str, src: dict) -> None:
         if not self.is_attached:
             return
+        refusal = check_rerun_owner(base, src["user"])
+        if refusal:
+            self.app.notify(refusal, severity="error", timeout=8)
+            return
+        submit_line = src["submit_line"]
+        args = build_array_rerun_args(submit_line, self._failed) if submit_line else None
         if not args:
             detail = (f"Recovered line is not an sbatch command:\n{submit_line}"
                       if submit_line else
                       "sacct/scontrol did not return the original submit line.")
             self.app.notify(f"Cannot rebuild the submission. {detail}",
-                            severity="error", timeout=8)
+                            severity="error", timeout=8, markup=False)
             return
+        # The full command is shown: this is exactly what will run as you.
         preview = " ".join(shlex.quote(a) for a in args)
+        where = f"\n\nfrom {src['workdir']}" if src["workdir"] else ""
         self.app.push_screen(
             ConfirmModal("Rerun failed array tasks",
                          f"{len(self._failed)} task(s): "
-                         f"{compact_indices(self._failed)}\n\n{preview[:200]}"),
-            callback=lambda ok: self._do_rerun(ok, args))
+                         f"{compact_indices(self._failed)}\n\n{preview}{where}"),
+            callback=lambda ok: self._do_rerun(ok, args, src["workdir"]))
 
-    def _do_rerun(self, confirmed: bool, args: list[str]) -> None:
-        if confirmed:
-            self._worker_submit_rerun(args)
+    def _do_rerun(self, confirmed: bool, args: list[str], workdir: str) -> None:
+        if not confirmed:
+            return
+        # One submission at a time: a second press while sbatch runs would
+        # submit the same tasks twice.
+        self.query_one("#btn-array-rerun", Button).disabled = True
+        self._worker_submit_rerun(args, workdir)
 
     @work(thread=True)
-    def _worker_submit_rerun(self, args: list[str]) -> None:
-        ok, msg = run_sbatch(args)
+    def _worker_submit_rerun(self, args: list[str], workdir: str) -> None:
+        ok, msg = run_sbatch(args, cwd=workdir or None)
         self.app.call_from_thread(self._rerun_done, ok, msg)
 
     def _rerun_done(self, ok: bool, msg: str) -> None:
         if ok:
             self.app.notify(f"Failed tasks resubmitted: {msg}",
-                            severity="information", timeout=7)
+                            severity="information", timeout=7, markup=False)
+        else:
+            self.app.notify(f"Resubmission failed: {msg}", severity="error",
+                            timeout=8, markup=False)
+        # The user may have closed this screen while sbatch ran; dismissing
+        # then would pop whatever screen is on top instead.
+        if not self.is_attached:
+            return
+        if ok:
             self.dismiss(None)
         else:
-            self.app.notify(f"Resubmission failed: {msg}", severity="error", timeout=8)
+            self.query_one("#btn-array-rerun", Button).disabled = False
 
     def on_key(self, event) -> None:
         if event.key == "escape":
@@ -2749,7 +2875,8 @@ class EfficiencyModal(ModalScreen):
             log.write(Text("  Accounting may be disabled, or the job is too old.", style=C.FG_FAINT))
             return
         verdict, vstyle = efficiency_verdict(rec)
-        title.update(f"Efficiency — job [bold {C.INFO}]{self._jobid}[/] {self._job_name}")
+        title.update(f"Efficiency — job [bold {C.INFO}]{escape_markup(self._jobid)}[/] "
+                     f"{escape_markup(self._job_name)}")
 
         def line(t="", s=C.FG):
             log.write(Text(t, style=s))
@@ -3043,7 +3170,7 @@ class BulkCancelModal(ModalScreen[Optional[list]]):
     def compose(self) -> ComposeResult:
         with Vertical(id="bulk-box"):
             yield Label(f"Cancel {len(self._jobs)} job(s) — {self._description}",
-                        id="bulk-title")
+                        id="bulk-title", markup=False)
             yield RichLog(id="bulk-list", highlight=False, markup=False, wrap=False)
             yield Label(f"This cannot be undone. Type {self.CONFIRM_WORD} to confirm:",
                         id="bulk-warn")
@@ -3107,8 +3234,10 @@ class ConfirmModal(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-box"):
-            yield Label(self._title,   id="confirm-title")
-            yield Label(self._message, id="confirm-msg")
+            # Messages quote job names and submit lines, which are free text
+            # ("[train]" vanished, "x[/]" crashed the app): never markup.
+            yield Label(self._title,   id="confirm-title", markup=False)
+            yield Label(self._message, id="confirm-msg", markup=False)
             with Horizontal(id="confirm-buttons"):
                 yield Button("Go back",  id="btn-no",  variant="default")
                 yield Button("Confirm",  id="btn-yes", variant="error")
@@ -3229,7 +3358,7 @@ class EditorPickerModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="picker-box"):
             yield Label("Open with editor", id="picker-title")
-            yield Label(f"  {self._file_path}", id="picker-path")
+            yield Label(f"  {self._file_path}", id="picker-path", markup=False)
             if AVAILABLE_EDITORS:
                 for label, binary in AVAILABLE_EDITORS:
                     yield Button(f"  {label}   ({binary})",
@@ -3348,13 +3477,20 @@ class ResourceMonitorModal(ModalScreen):
         if self._timer: self._timer.stop()
         self.dismiss()
 
+    _fetching: bool = False
+
     def _do_refresh(self) -> None:
+        # One refresh at a time.  Each SSHes to up to max_nodes nodes with
+        # a timeout that can exceed the refresh interval, and a thread
+        # worker cannot be cancelled: starting a new one every tick piled
+        # up SSH sessions and let a late, older result overwrite a newer one.
+        if self._fetching:
+            return
+        self._fetching = True
         self._fetch_resources(self._jobid)
 
-    @work(thread=True, exclusive=True, group="monitor")
+    @work(thread=True, group="monitor")
     def _fetch_resources(self, jobid: str) -> None:
-        # exclusive: each refresh SSHes to up to 8 nodes twice with an 8 s
-        # timeout, which routinely exceeds the 8 s refresh interval.
         lines: list[tuple[str, str]] = []  # (text, style)
 
         def sep(title: str = "") -> None:
@@ -3399,6 +3535,8 @@ class ResourceMonitorModal(ModalScreen):
             lines.append(("  No nodes assigned (job still PENDING?)", C.FG_FAINT))
         else:
             for node in nodes[:max_nodes]:
+                if not self.is_attached:
+                    break           # closed meanwhile: stop SSHing to nodes
                 sep(f"NODE: {node}")
 
                 # ── Allocation, straight from the controller (no SSH) ──
@@ -3488,6 +3626,7 @@ class ResourceMonitorModal(ModalScreen):
         self.app.call_from_thread(self._apply_monitor, lines, ts)
 
     def _apply_monitor(self, lines: list[tuple[str, str]], ts: str) -> None:
+        self._fetching = False
         if not self.is_attached:
             return
         self.query_one("#mon-refresh-lbl", Label).update(f"  ↻ {ts}")
@@ -3571,7 +3710,7 @@ class LogViewerModal(ModalScreen):
         live_indicator = "  ·  live" if self._live else "  ·  static"
         title = f"  Log — job {self._jobid}  ·  {self._job_name}  ·  {self._state}{live_indicator}"
         with Vertical(id="log-box"):
-            yield Label(title, id="log-title")
+            yield Label(title, id="log-title", markup=False)
             with Horizontal(id="log-tab-row"):
                 yield Button("stdout", id="btn-show-stdout")
                 yield Button("stderr", id="btn-show-stderr")
@@ -3655,7 +3794,7 @@ class LogViewerModal(ModalScreen):
         if not path:
             self.app.notify("No file path available yet", severity="warning"); return
         if not os.path.exists(path):
-            self.app.notify(f"File not found: {path}", severity="warning"); return
+            self.app.notify(f"File not found: {path}", severity="warning", markup=False); return
         if not AVAILABLE_EDITORS:
             self.app.notify("No editors found in PATH (nvim, vim, nano…)", severity="warning"); return
         self.app.push_screen(
@@ -3700,21 +3839,27 @@ class LogViewerModal(ModalScreen):
             "plain": C.FG,
         }[cls.classify(line)]
 
-    @work(thread=True, exclusive=True, group="logview")
     def _show_stream(self, which: str) -> None:
-        """Read whatever is new on this stream (runs in a background thread)."""
+        """Switch to (or refresh) a stream and read whatever is new on it.
+
+        The selection and the starting offset are fixed here, on the UI
+        thread; the worker only reads the file.  Deciding them inside the
+        thread let a timer tick undo a click on the other stream, and two
+        overlapping reads from one offset appended the same lines twice.
+        """
         self._showing = which
         path = self._stdout_path if which == "stdout" else self._stderr_path
+        self._read_stream(which, path, self._offsets.get(which, 0))
 
+    @work(thread=True, group="logview")
+    def _read_stream(self, which: str, path: str, start: int) -> None:
         if not path or not os.path.exists(path):
             msg = f"(File not found: {path})" if path else "(No path available)"
             self.app.call_from_thread(self._apply_stream_error, which, path, msg)
             return
-
-        lines, offset, reset = follow_file(path, self._offsets.get(which, 0),
-                                           LOG_TAIL_LINES)
+        lines, offset, reset = follow_file(path, start, LOG_TAIL_LINES)
         self.app.call_from_thread(self._apply_stream_lines,
-                                  which, path, lines, offset, reset)
+                                  which, path, start, lines, offset, reset)
 
     def _apply_stream_error(self, which: str, path: str, msg: str) -> None:
         if not self.is_attached:
@@ -3731,10 +3876,12 @@ class LogViewerModal(ModalScreen):
         log.write(Text(msg, style=f"{C.FG_FAINT} italic"))
         self.query_one("#log-match-lbl", Label).update("")
 
-    def _apply_stream_lines(self, which: str, path: str, lines: list[str],
-                            offset: int, reset: bool) -> None:
+    def _apply_stream_lines(self, which: str, path: str, start: int,
+                            lines: list[str], offset: int, reset: bool) -> None:
         if not self.is_attached:
             return
+        if self._offsets.get(which, 0) != start:
+            return              # another read already consumed these bytes
         self._offsets[which] = offset
         if reset:
             self._buffers[which] = list(lines)
@@ -3755,7 +3902,7 @@ class LogViewerModal(ModalScreen):
     def _sync_header(self, which: str, path: str) -> None:
         self.query_one("#btn-show-stdout", Button).set_class(which == "stdout", "active-log")
         self.query_one("#btn-show-stderr", Button).set_class(which == "stderr", "active-log")
-        self.query_one("#path-label", Label).update(f"  {path}")
+        self.query_one("#path-label", Label).update(Text(f"  {path}"))
 
     def _matcher(self):
         """Predicate for the current filter.
@@ -3895,6 +4042,21 @@ def cell_by_col(table, name: str) -> str | None:
     return val or None
 
 
+def restore_cursor(table, row: int | None, old_row: int) -> None:
+    """Put the cursor back after a table was cleared and refilled.
+
+    DataTable.clear() moves the cursor to row 0, so every refresh used to
+    jump to the top.  `row` is where the previously selected job now sits;
+    if that job has gone, the cursor keeps its position instead of landing
+    on whatever job happens to be first.
+    """
+    if table.row_count == 0:
+        return
+    target = row if row is not None else min(old_row, table.row_count - 1)
+    if target != table.cursor_row:
+        table.move_cursor(row=target)
+
+
 class HistoryTable(DataTable):
     """Panel 4: searchable history of all past jobs."""
     COLS_FULL = [
@@ -3946,12 +4108,8 @@ class HistoryTable(DataTable):
     def populate(self, history: list[dict], filter_text: str = "") -> None:
         self._last_render = (history, filter_text)
         # Preserve cursor position across refreshes
-        selected_jobid = None
-        if self.row_count > 0:
-            try:
-                selected_jobid = str(self.get_cell_at((self.cursor_row, 0))).strip() or None
-            except Exception:
-                pass
+        selected_jobid = cell_by_col(self, "JOBID")
+        old_row = self.cursor_row
         self.clear()
         ft = filter_text.lower()
         # Show most recent first
@@ -3980,8 +4138,7 @@ class HistoryTable(DataTable):
             if e.get("jobid") == selected_jobid:
                 new_cursor = idx
             idx += 1
-        if new_cursor is not None:
-            self.move_cursor(row=new_cursor)
+        restore_cursor(self, new_cursor, old_row)
 
     def get_selected_jobid(self) -> str | None:
         return cell_by_col(self, "JOBID")
@@ -4043,6 +4200,7 @@ class SqueueTable(DataTable):
     def refresh_jobs(self, jobs: list[dict]) -> None:
         self._last_jobs = jobs
         selected_jobid = cell_by_col(self, "JOBID")
+        old_row = self.cursor_row
         self.clear()
         new_cursor = None
         pins = self.pinned
@@ -4072,7 +4230,7 @@ class SqueueTable(DataTable):
                 return vals.get(key, Text(""))
             self.add_row(*[cv(k) for k in col_keys])
             if j["jobid"] == selected_jobid: new_cursor = idx
-        if new_cursor is not None: self.move_cursor(row=new_cursor)
+        restore_cursor(self, new_cursor, old_row)
 
     def get_selected_jobid(self) -> str | None:
         return cell_by_col(self, "JOBID")
@@ -4134,6 +4292,7 @@ class MyJobsTable(DataTable):
     def refresh_jobs(self, jobs: list[dict]) -> None:
         self._last_jobs = jobs
         selected_jobid = cell_by_col(self, "JOBID")
+        old_row = self.cursor_row
         self.clear()
         mine = [j for j in jobs if j.get("user") == MY_USER]
         if not mine:
@@ -4168,7 +4327,7 @@ class MyJobsTable(DataTable):
                 return vals.get(key, Text(""))
             self.add_row(*[mv(k) for k in col_keys])
             if j["jobid"] == selected_jobid: new_cursor = idx
-        if new_cursor is not None: self.move_cursor(row=new_cursor)
+        restore_cursor(self, new_cursor, old_row)
 
     def get_selected_jobid(self) -> str | None:
         val = cell_by_col(self, "JOBID")
@@ -4356,6 +4515,7 @@ class WatchlistTable(DataTable):
 
     def populate(self, rows: list) -> None:
         selected = cell_by_col(self, "JOBID")
+        old_row = self.cursor_row
         self._last_rows = rows
         self.clear()
         if not rows:
@@ -4385,8 +4545,7 @@ class WatchlistTable(DataTable):
             self.add_row(*[value(k) for k in col_keys])
             if row["jobid"] == selected:
                 new_cursor = idx
-        if new_cursor is not None:
-            self.move_cursor(row=new_cursor)
+        restore_cursor(self, new_cursor, old_row)
 
     def get_selected_jobid(self):
         val = cell_by_col(self, "JOBID")
@@ -4805,6 +4964,9 @@ class SlurmDashboard(App):
         # Instance state — these were mutable class attributes, i.e. shared by
         # every instance of the app.
         self._prev_states: dict[str, str] = {}
+        self._refresh_seq = itertools.count(1)   # next() is thread-safe
+        self._applied_seq = 0
+        self._squeue_failing = False
         self._history: list[dict] = []
         self._jobs_by_id: dict[str, dict] = {}
         self._watchlist: list = []
@@ -4901,7 +5063,9 @@ class SlurmDashboard(App):
         self._history = load_history()
         self._watchlist = load_watchlist()
         self._worker_seed_history()        # import recent jobs from sacct
-        self._worker_fix_stale_history()   # audit stale RUNNING/PENDING on startup
+        self._worker_fix_stale_history(    # audit stale RUNNING/PENDING on startup
+            [e["jobid"] for e in self._history
+             if e.get("state", "").upper() in STALE_HISTORY_STATES])
         self.refresh_data()
         self.set_interval(REFRESH_INTERVAL, self.refresh_data)
 
@@ -5072,9 +5236,6 @@ class SlurmDashboard(App):
             entry["stderr"] = paths.get("stderr", "")
             save_history(self._history)
 
-    def _persist_history(self) -> None:
-        save_history(self._history)
-
     def _push_log_viewer_from_paths(self, jobid: str, paths: dict, live: bool) -> None:
         if not paths["stdout"] and not paths["stderr"]:
             self.notify(
@@ -5108,96 +5269,49 @@ class SlurmDashboard(App):
         if not jobid:
             self.notify("Select a job from History first", severity="warning")
             return
-        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
-        name  = entry.get("name", "") if entry else ""
-        sl    = entry.get("submit_line", "") if entry else ""
+        entry = next((e for e in self._history if e.get("jobid") == jobid), {})
+        name  = entry.get("name", "")
+        sl    = entry.get("submit_line", "")
         if sl:
             hint = f"SubmitLine cached: {sl[:70]}{'…' if len(sl)>70 else ''}"
         else:
             hint = "No SubmitLine cached → will be searched in sacct/scontrol/requeue"
         self.push_screen(
             ConfirmModal("Confirm resubmission", f"Job {jobid}  [{name}]\n{hint}"),
-            callback=lambda ok: self._do_history_rerun(ok, jobid),
+            callback=lambda ok: self._do_history_rerun(ok, jobid, sl, entry.get("user", "")),
         )
 
-    def _do_history_rerun(self, confirmed: bool, jobid: str) -> None:
+    def _do_history_rerun(self, confirmed: bool, jobid: str,
+                          cached_line: str, owner: str) -> None:
         if not confirmed:
             return
         self.notify(f"Resubmitting job {jobid}…", timeout=3)
-        self._worker_rerun(jobid)
+        self._worker_rerun(jobid, cached_line, owner)
 
     @work(thread=True)
-    def _worker_rerun(self, jobid: str) -> None:
-        entry     = next((e for e in self._history if e.get("jobid") == jobid), None)
-        cached_sl = entry.get("submit_line", "") if entry else ""
-        ok, msg   = False, ""
-
-        if not is_valid_jobid(jobid):
-            self.app.call_from_thread(self._rerun_fail, jobid,
-                                      f"Invalid job id: {jobid!r}")
-            return
-
-        # Strategy 1+2: try cached submit_line first.  build_sbatch_args()
-        # rejects a line that is not an sbatch call or a script path instead
-        # of prepending "sbatch" to whatever the history file happened to say.
-        if cached_sl:
-            args = build_sbatch_args(cached_sl)
-            if args:
-                ok, msg = run_sbatch(args)
-            else:
-                ok, msg = False, f"Cached submit line is not an sbatch command: {cached_sl!r}"
-
-        # If no cache or it failed, query sacct + scontrol
-        if not ok:
-            fresh_sl = get_submit_line(jobid)
-            if fresh_sl:
-                args = build_sbatch_args(fresh_sl)
-                if args:
-                    ok, msg = run_sbatch(args)
-                    # Cache the submit line for future reruns
-                    if ok and entry:
-                        entry["submit_line"] = fresh_sl
-                        self.app.call_from_thread(self._persist_history)
-                else:
-                    ok, msg = False, f"Recovered submit line is not an sbatch command: {fresh_sl!r}"
-
-        # Last fallback: scontrol requeue (job must still exist in Slurm)
-        if not ok:
-            # run() cannot raise: the bare subprocess.run() used here before
-            # propagated TimeoutExpired/FileNotFoundError out of the worker
-            # thread, leaving the rerun silently dead with no notification.
-            _, requeue_err = run(["scontrol", "requeue", jobid], timeout=20)
-            if not requeue_err.strip():
-                ok  = True
-                msg = f"Job {jobid} requeued → back to PENDING"
-            else:
-                # Build informative error message
-                requeue_err = requeue_err.strip()
-                script_info = get_job_script_info(jobid)
-                hint = ""
-                if script_info["command"] and os.path.isfile(script_info["command"]):
-                    hint = f"\nScript found: sbatch {script_info['command']}"
-                elif script_info["command"]:
-                    hint = f"\nScript (not accessible): {script_info['command']}"
-                msg = (
-                    f"Could not resubmit automatically.\n"
-                    f"requeue: {requeue_err or 'failed'}\n"
-                    f"Tip: add the SubmitLine to the submit_line field in the history JSON,\n"
-                    f"or submit manually: sbatch <your_script.sh>{hint}"
-                )
-
+    def _worker_rerun(self, jobid: str, cached_line: str, owner: str) -> None:
+        # Everything read from self._history was captured on the UI thread;
+        # the worker only talks to Slurm.
+        ok, msg, used_line = rerun_history_job(jobid, cached_line, owner)
         if ok:
-            self.app.call_from_thread(self._rerun_ok, jobid, msg)
+            self.app.call_from_thread(self._rerun_ok, jobid, msg, used_line)
         else:
             self.app.call_from_thread(self._rerun_fail, jobid, msg)
 
-    def _rerun_ok(self, jobid: str, msg: str) -> None:
-        self.notify(msg or f"Job {jobid} resubmitted", severity="information", timeout=7)
+    def _rerun_ok(self, jobid: str, msg: str, used_line: str = "") -> None:
+        self.notify(msg or f"Job {jobid} resubmitted", severity="information",
+                    timeout=7, markup=False)
+        # Remember the line that worked, so the next rerun needs no lookup.
+        entry = next((e for e in self._history if e.get("jobid") == jobid), None)
+        if entry is not None and used_line and entry.get("submit_line") != used_line:
+            entry["submit_line"] = used_line
+            save_history(self._history)
         self.query_one(EventLog).log_event(f"rerun {jobid} → {msg}", f"bold {C.OK}")
         self.refresh_data()
 
     def _rerun_fail(self, jobid: str, err: str) -> None:
-        self.notify(f"Error resubmitting {jobid}: {err}", severity="error", timeout=10)
+        self.notify(f"Error resubmitting {jobid}: {err}", severity="error",
+                    timeout=10, markup=False)
         self.query_one(EventLog).log_event(f"rerun {jobid} FAIL: {err}", f"bold {C.ERR}")
 
     # ── job actions ──
@@ -5247,74 +5361,70 @@ class SlurmDashboard(App):
         state    = job.get("state") or cell_by_col(t, "STATE") or ""
         self.push_screen(ResourceMonitorModal(jobid, job_name=job_name, state=state))
 
-    def action_job_scancel(self) -> None:
+    def _selected_own_job(self, verb: str) -> str | None:
+        """The selected job id if the user may `verb` it; otherwise None,
+        after telling them why.  Ownership comes from the squeue snapshot."""
         jobid = self._get_selected_jobid()
         user  = self._get_selected_user()
         if not jobid:
-            self.notify("Select a job first", severity="warning"); return
+            self.notify("Select a job first", severity="warning")
+            return None
         if user is None:
-            self.notify("Cannot determine the owner of this job — refusing to cancel",
-                        severity="error"); return
+            self.notify(f"Cannot determine the owner of this job — refusing to {verb}",
+                        severity="error")
+            return None
         if user != MY_USER:
-            self.notify(f"Cannot cancel jobs belonging to another user ({user})",
-                        severity="error"); return
+            self.notify(f"Cannot {verb} jobs belonging to another user ({user})",
+                        severity="error", markup=False)
+            return None
+        if not is_valid_jobid(jobid):
+            self.notify(f"Invalid job id: {jobid!r}", severity="error")
+            return None
+        return jobid
+
+    def action_job_scancel(self) -> None:
+        jobid = self._selected_own_job("cancel")
+        if not jobid:
+            return
         self.push_screen(
             ConfirmModal("Confirm cancel",
                          f"Cancel job  {jobid}?  This cannot be undone."),
-            callback=lambda ok: self._do_scancel(ok, jobid),
+            callback=lambda ok: ok and self._worker_job_command(
+                ["scancel", jobid], f"Job {jobid} cancelled",
+                f"scancel {jobid}", f"bold {C.WARN}"),
         )
 
-    def _do_scancel(self, confirmed: bool, jobid: str) -> None:
-        if not confirmed: return
-        if not is_valid_jobid(jobid):
-            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
-        _, stderr = run(["scancel", jobid])
-        if stderr.strip():
-            self.notify(f"scancel error: {stderr.strip()}", severity="error", timeout=6)
-            self.query_one(EventLog).log_event(f"scancel {jobid} ERROR: {stderr.strip()}", f"bold {C.ERR}")
-        else:
-            self.notify(f"Job {jobid} cancelled", severity="information", timeout=4)
-            self.query_one(EventLog).log_event(f"scancel {jobid} → OK  (by {MY_USER})", f"bold {C.WARN}")
-        self.refresh_data()
-
     def action_job_hold(self) -> None:
-        jobid = self._get_selected_jobid()
-        user  = self._get_selected_user()
-        if not jobid:
-            self.notify("Select a job first", severity="warning"); return
-        if user is None:
-            self.notify("Cannot determine the owner of this job — refusing to hold",
-                        severity="error"); return
-        if user != MY_USER:
-            self.notify("Cannot hold jobs belonging to another user", severity="error"); return
-        if not is_valid_jobid(jobid):
-            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
-        _, stderr = run(["scontrol", "hold", jobid])
-        if stderr.strip():
-            self.notify(f"hold error: {stderr.strip()}", severity="error", timeout=6)
-        else:
-            self.notify(f"Job {jobid} placed on hold", severity="information", timeout=3)
-            self.query_one(EventLog).log_event(f"scontrol hold {jobid} → OK", C.WARN)
-        self.refresh_data()
+        jobid = self._selected_own_job("hold")
+        if jobid:
+            self._worker_job_command(["scontrol", "hold", jobid],
+                                     f"Job {jobid} placed on hold",
+                                     f"scontrol hold {jobid}", C.WARN)
 
     def action_job_release(self) -> None:
-        jobid = self._get_selected_jobid()
-        user  = self._get_selected_user()
-        if not jobid:
-            self.notify("Select a job first", severity="warning"); return
-        if user is None:
-            self.notify("Cannot determine the owner of this job — refusing to release",
-                        severity="error"); return
-        if user != MY_USER:
-            self.notify("Cannot release jobs belonging to another user", severity="error"); return
-        if not is_valid_jobid(jobid):
-            self.notify(f"Invalid job id: {jobid!r}", severity="error"); return
-        _, stderr = run(["scontrol", "release", jobid])
-        if stderr.strip():
-            self.notify(f"release error: {stderr.strip()}", severity="error", timeout=6)
+        jobid = self._selected_own_job("release")
+        if jobid:
+            self._worker_job_command(["scontrol", "release", jobid],
+                                     f"Job {jobid} released",
+                                     f"scontrol release {jobid}", f"bold {C.OK}")
+
+    @work(thread=True)
+    def _worker_job_command(self, cmd: list[str], done_msg: str,
+                            label: str, style: str) -> None:
+        """Run scancel/scontrol off the UI thread: on a loaded controller
+        they can take seconds, and the whole TUI used to freeze meanwhile."""
+        _, err = run(cmd)
+        self.app.call_from_thread(self._job_command_done, err.strip(),
+                                  done_msg, label, style)
+
+    def _job_command_done(self, err: str, done_msg: str, label: str, style: str) -> None:
+        log = self.query_one(EventLog)
+        if err:
+            self.notify(f"{label} failed: {err}", severity="error", timeout=6, markup=False)
+            log.log_event(f"{label} ERROR: {err}", f"bold {C.ERR}")
         else:
-            self.notify(f"Job {jobid} released", severity="information", timeout=3)
-            self.query_one(EventLog).log_event(f"scontrol release {jobid} → OK", f"bold {C.OK}")
+            self.notify(done_msg, severity="information", timeout=4)
+            log.log_event(f"{label} → OK  (by {MY_USER})", style)
         self.refresh_data()
 
     # ── reservations ────────────────────────────────────────────────────
@@ -5506,39 +5616,20 @@ class SlurmDashboard(App):
 
     # ── data refresh ──
     @work(thread=True)
-    def _worker_fix_stale_history(self) -> None:
+    def _worker_fix_stale_history(self, stale: list[str]) -> None:
         """
-        On startup: find history entries stuck in a live state (RUNNING, PENDING,
-        COMPLETING, etc.) and resolve their real final state via sacct.
+        On startup: resolve the real final state of history entries left in
+        a live state (RUNNING, PENDING, UNKNOWN, ...) by a previous session.
         Runs entirely in background — does not block the UI.
         """
-        live_states = {"RUNNING", "R", "PENDING", "PD", "COMPLETING", "CG",
-                       "CONFIGURING", "CF", "RESIZING", "RS", "SUSPENDED", "S",
-                       "PREEMPTED", "PR", "REQUEUED", "RQ", "UNKNOWN", ""}
-        stale = [
-            e["jobid"] for e in self._history
-            if e.get("state", "").upper() in live_states
-        ]
         if not stale:
             return
-        # Chunk into batches of 50 to avoid overly long sacct command lines
-        def chunks(lst, n):
-            for i in range(0, len(lst), n):
-                yield lst[i:i + n]
-        resolved: dict[str, str] = {}
-        for batch in chunks(stale, 50):
-            resolved.update(sacct_final_state(batch))
-        if not resolved:
-            return
+        # sacct_final_state batches the ids itself.
+        resolved = sacct_final_state(stale)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        updates = []
-        for jid, real_state in resolved.items():
-            # Normalise "CANCELLED by 1234" → "CANCELLED" (sacct format)
-            real_state = real_state.split()[0].upper()
-            # Skip if sacct returned a live state too (job genuinely still running)
-            if real_state in live_states:
-                continue
-            updates.append((jid, real_state, now))
+        # A live state from sacct means the job genuinely is still running.
+        updates = [(jid, state, now) for jid, state in resolved.items()
+                   if state not in STALE_HISTORY_STATES]
         if updates:
             self.app.call_from_thread(self._apply_stale_fixes, updates)
 
@@ -5570,36 +5661,76 @@ class SlurmDashboard(App):
 
     @work(thread=True, exclusive=True, group="refresh")
     def refresh_data(self) -> None:
-        # exclusive: squeue/sinfo can take seconds on a loaded controller,
-        # and the 3 s timer would otherwise stack workers indefinitely.
-        jobs  = parse_squeue()
+        """Poll Slurm in a worker thread and hand the snapshot to the UI.
+
+        exclusive: squeue/sinfo can take seconds on a loaded controller, and
+        the timer would otherwise stack workers indefinitely.  A superseded
+        thread still runs to the end, though, so every snapshot carries a
+        sequence number and _apply_update drops any older than the last one
+        it applied.
+        """
+        seq = next(self._refresh_seq)
+        jobs = parse_squeue()
+        if jobs is None:
+            # A failed or timed-out squeue says nothing about the jobs; an
+            # empty list here used to announce every running job as finished.
+            self.call_from_thread(self._apply_squeue_failure, seq)
+            return
         nodes = parse_sinfo()
         stats = compute_stats(jobs)
         ts    = datetime.now().strftime("%H:%M:%S")
 
         # Fetch estimated start times for PENDING jobs and merge into job dicts
-        pending_ids = {j["jobid"] for j in jobs
-                       if j["state"] in ("PD", "PENDING")}
-        if pending_ids:
+        if any(j["state"] in ("PD", "PENDING") for j in jobs):
             estimates = get_start_estimates()
             for j in jobs:
                 if j["jobid"] in estimates:
                     j["est_start"] = estimates[j["jobid"]]
-        events = []
-        cur_states = {j["jobid"]: j["state"] for j in jobs}
-        for jid, st in cur_states.items():
-            old = self._prev_states.get(jid)
-            if old is not None and old != st:
-                events.append((jid, old, st))
-        _active = {"R", "RUNNING", "PD", "PENDING", "CG", "COMPLETING",
-                   "S", "SUSPENDED", "PR", "PREEMPTED"}
-        for jid, old_st in self._prev_states.items():
-            if jid not in cur_states and old_st in _active:
-                events.append((jid, old_st, "GONE"))
-        self._prev_states = cur_states
-        self.call_from_thread(self._apply_update, jobs, nodes, stats, ts, events)
+        self.call_from_thread(self._apply_update, seq, jobs, nodes, stats, ts)
 
-    def _apply_update(self, jobs, nodes, stats, ts, events) -> None:
+    def _is_stale_snapshot(self, seq: int) -> bool:
+        if seq <= self._applied_seq:
+            return True
+        self._applied_seq = seq
+        return False
+
+    def _apply_squeue_failure(self, seq: int) -> None:
+        if self._is_stale_snapshot(seq):
+            return
+        # Tell the user once per outage rather than every few seconds.
+        if not self._squeue_failing:
+            self._squeue_failing = True
+            self.notify("squeue is not responding — showing the last known data",
+                        severity="warning", timeout=6)
+            self.query_one(EventLog).log_event(
+                "squeue failed; job states are not being updated", C.WARN)
+
+    def _diff_states(self, jobs: list[dict]) -> list[tuple[str, str, str]]:
+        """(jobid, old_state, new_state) for every change since the last poll.
+
+        A live job missing from this poll gets new_state "GONE"; its real
+        final state is then looked up in sacct.
+        """
+        cur_states = {j["jobid"]: j["state"] for j in jobs}
+        events = [(jid, self._prev_states[jid], st)
+                  for jid, st in cur_states.items()
+                  if jid in self._prev_states and self._prev_states[jid] != st]
+        events += [(jid, old_st, "GONE")
+                   for jid, old_st in self._prev_states.items()
+                   if jid not in cur_states and old_st in ACTIVE_STATES]
+        self._prev_states = cur_states
+        return events
+
+    def _apply_update(self, seq, jobs, nodes, stats, ts) -> None:
+        if self._is_stale_snapshot(seq):
+            return
+        if self._squeue_failing:
+            self._squeue_failing = False
+            self.query_one(EventLog).log_event("squeue is responding again", C.OK)
+        # Diffed here, on the UI thread, in snapshot order: done in the
+        # workers, two overlapping polls could each see a job vanish and
+        # announce it twice.
+        events = self._diff_states(jobs)
         self._jobs_by_id = {j["jobid"]: j for j in jobs}
         pins = watchlist_ids(self._watchlist)
         self.query_one(SqueueTable).pinned = pins
@@ -5662,25 +5793,14 @@ class SlurmDashboard(App):
     def _worker_resolve_gone(self, gone_jids: list[str]) -> None:
         """
         For each jobid that disappeared from squeue, queries sacct for
-        get its final real state (COMPLETED, FAILED, TIMEOUT, etc.)
+        its final real state (COMPLETED, FAILED, TIMEOUT, etc.)
         and updates the history + event log.
         """
         final_states = sacct_final_state(gone_jids)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        updates = []
-        for jid in gone_jids:
-            real_state = final_states.get(jid, "COMPLETED")
-            # Normalise sacct aliases
-            aliases = {
-                "CANCELLED": "CANCELLED", "CANCELED": "CANCELLED",
-                "FAILED": "FAILED", "TIMEOUT": "TIMEOUT",
-                "OUT_OF_MEMORY": "OUT_OF_MEMORY", "NODE_FAIL": "NODE_FAIL",
-                "COMPLETED": "COMPLETED", "PREEMPTED": "PREEMPTED",
-            }
-            # sacct sometimes returns "CANCELLED by 1234" → take first word
-            real_state = real_state.split()[0].upper()
-            real_state = aliases.get(real_state, real_state)
-            updates.append((jid, real_state, now))
+        # No sacct record (accounting lag, sacct down): "UNKNOWN", never a
+        # guessed "COMPLETED".  UNKNOWN is re-checked by the startup audit.
+        updates = [(jid, final_states.get(jid, "UNKNOWN"), now) for jid in gone_jids]
         self.app.call_from_thread(self._apply_resolve_gone, updates)
 
     def _apply_resolve_gone(self, updates: list[tuple]) -> None:
@@ -5694,7 +5814,11 @@ class SlurmDashboard(App):
                 entry["state"]     = real_state
                 entry["last_seen"] = now
                 changed = True
-                if entry.get("user", MY_USER) == MY_USER:
+                # Only a real end is announced (and runs the user's hook): a
+                # job that left squeue but is still RUNNING in sacct — e.g. a
+                # pending array range splitting into tasks — has not finished.
+                if (entry.get("user", MY_USER) == MY_USER
+                        and real_state in TERMINAL_STATES):
                     finished.append((jid, real_state, entry.get("name", "")))
             else:
                 old_state = "?"
@@ -5718,7 +5842,7 @@ class SlurmDashboard(App):
                             else "error")
                 label = f" ({name})" if name else ""
                 self.notify(f"Job {jid}{label} finished: {state}",
-                            severity=severity, timeout=10)
+                            severity=severity, timeout=10, markup=False)
             if len(finished) > 5:
                 self.notify(f"…and {len(finished) - 5} more jobs finished", timeout=6)
         if cfg["bell_on_finish"]:
@@ -5735,20 +5859,21 @@ class SlurmDashboard(App):
         for jid, state, name in finished:
             run_completion_hook(hook, jid, state, name)
 
+    # The stats workers get a snapshot taken on the UI thread: the refresh
+    # loop edits self._history in place (and trims it) while they run.
     def refresh_stats(self) -> None:
-        self._worker_stats()
+        self._worker_stats([dict(e) for e in self._history])
 
     def refresh_efficiency(self) -> None:
         self.notify("Querying sacct for efficiency data…", timeout=4)
-        self._worker_efficiency()
-
-    @work(thread=True, exclusive=True, group="efficiency")
-    def _worker_efficiency(self) -> None:
         done = [e for e in self._history
                 if (e.get("state") or "").upper() in TERMINAL_STATES]
         recent = done[-150:]
-        names = {e["jobid"]: e.get("name", "") for e in recent}
-        data = get_job_efficiency([e["jobid"] for e in recent])
+        self._worker_efficiency({e["jobid"]: e.get("name", "") for e in recent})
+
+    @work(thread=True, exclusive=True, group="efficiency")
+    def _worker_efficiency(self, names: dict[str, str]) -> None:
+        data = get_job_efficiency(list(names))
         self.app.call_from_thread(self._apply_efficiency, data, names)
 
     def _apply_efficiency(self, data: dict, names: dict) -> None:
@@ -5758,8 +5883,8 @@ class SlurmDashboard(App):
             pass
 
     @work(thread=True)
-    def _worker_stats(self) -> None:
-        stats = compute_history_stats(self._history)
+    def _worker_stats(self, history: list[dict]) -> None:
+        stats = compute_history_stats(history)
         self.app.call_from_thread(self._apply_stats, stats, None)
 
     def _apply_stats(self, stats: dict, errors: list | None) -> None:
@@ -5854,7 +5979,8 @@ class SlurmDashboard(App):
             desc = f"your jobs matching '{selector.strip()}'"
         jobs = [j for j in jobs if is_valid_jobid(j.get("jobid", ""))]
         if not jobs:
-            self.notify(f"No jobs matched {desc}", severity="warning", timeout=4)
+            self.notify(f"No jobs matched {desc}", severity="warning", timeout=4,
+                        markup=False)
             return
         self.push_screen(BulkCancelModal(jobs, desc), callback=self._bulk_cancel_confirmed)
 
@@ -5883,7 +6009,7 @@ class SlurmDashboard(App):
         log = self.query_one(EventLog)
         if errors:
             self.notify(f"Cancelled {done}/{total}; errors: {errors[0][:120]}",
-                        severity="error", timeout=8)
+                        severity="error", timeout=8, markup=False)
             log.log_event(f"bulk scancel {done}/{total} — {errors[0][:80]}", f"bold {C.ERR}")
         else:
             self.notify(f"Cancelled {done} job(s)", severity="information", timeout=5)

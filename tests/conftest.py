@@ -62,12 +62,12 @@ def fake_slurm(sd, monkeypatch):
             self.responses: dict[str, str] = {}
             self.calls: list[list[str]] = []
 
-        def set(self, binary, output):
-            self.responses[binary] = output
+        def set(self, binary, output, err=""):
+            self.responses[binary] = (output, err)
 
-        def __call__(self, cmd, timeout=10):
+        def __call__(self, cmd, timeout=10, cwd=None):
             self.calls.append(list(cmd))
-            return (self.responses.get(cmd[0], ""), "")
+            return self.responses.get(cmd[0], ("", ""))
 
     fake = Fake()
     monkeypatch.setattr(sd, "run", fake)

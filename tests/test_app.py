@@ -564,6 +564,72 @@ class TestCompletionNotifications:
         run(scenario())
 
 
+class TestRefreshRobustness:
+    def test_failed_squeue_does_not_finish_every_job(self, sd, monkeypatch, tmp_path):
+        """A timed-out squeue used to look like an empty queue, so every
+        running job was announced as finished and the hook fired for each."""
+        app = make_app(sd, monkeypatch, tmp_path)
+        resolved = []
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert "101" in app._prev_states
+                app._worker_resolve_gone = lambda ids: resolved.extend(ids)
+                monkeypatch.setattr(sd, "parse_squeue", lambda: None)
+                app.refresh_data()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                assert resolved == []
+                assert "101" in app._prev_states        # still tracked
+                assert app.query_one(sd.SqueueTable).row_count == 4
+                app.exit()
+        run(scenario())
+
+    def test_older_snapshot_never_overwrites_a_newer_one(self, sd, monkeypatch, tmp_path):
+        app = make_app(sd, monkeypatch, tmp_path)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                newest = app._applied_seq
+                app._apply_update(newest - 1, [], [], sd.compute_stats([]), "00:00:00")
+                await pilot.pause()
+                assert app.query_one(sd.SqueueTable).row_count == 4
+                assert "101" in app._prev_states
+                app.exit()
+        run(scenario())
+
+    def test_unresolved_job_is_not_announced(self, sd, monkeypatch, tmp_path):
+        """No sacct record must not be reported (and hooked) as COMPLETED."""
+        app = make_app(sd, monkeypatch, tmp_path, {"sacct": ""})
+        notices, hooks = [], []
+        monkeypatch.setitem(sd.CONFIG["notifications"], "hook", "/bin/true")
+        monkeypatch.setattr(sd, "run_completion_hook",
+                            lambda h, j, s, n: hooks.append((j, s)))
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda m, **k: notices.append(str(m))
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                app._worker_resolve_gone(["101"])
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                entry = next(e for e in app._history if e["jobid"] == "101")
+                assert entry["state"] == "UNKNOWN"
+                assert hooks == []
+                assert not any("finished" in n for n in notices)
+                app.exit()
+        run(scenario())
+
+
 class TestKeyBindings:
     def test_new_bindings_are_registered(self, sd):
         keys = {key: action for key, action, _ in sd.SlurmDashboard.BINDINGS}

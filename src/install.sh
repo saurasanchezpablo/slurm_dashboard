@@ -24,8 +24,11 @@ fi
 echo ""
 echo "==> Adding alias to ~/.bashrc and ~/.zshrc (if they exist)..."
 
-# Quote both paths: either may contain spaces.
-ALIAS_LINE="alias sqdash='\"$PY\" \"${SCRIPT_DIR}/slurm_dashboard.py\"'"
+# printf %q quotes both paths for the shell, then quotes the whole command
+# again for the alias: a checkout path containing spaces or a quote would
+# otherwise break out of the alias and run on every shell start.
+SQDASH_CMD="$(printf '%q %q' "$PY" "${SCRIPT_DIR}/slurm_dashboard.py")"
+ALIAS_LINE="alias sqdash=$(printf '%q' "$SQDASH_CMD")"
 
 for rcfile in "$HOME/.bashrc" "$HOME/.zshrc"; do
     if [ -f "$rcfile" ]; then

