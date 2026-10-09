@@ -364,6 +364,37 @@ class TestLogViewer:
                 app.exit()
         run(scenario())
 
+    def test_switching_back_to_stdout_redraws(self, sd, monkeypatch, tmp_path):
+        out = tmp_path / "job.out"
+        err = tmp_path / "job.err"
+        out.write_text("stdout line\n")
+        err.write_text("stderr line\n")
+        app = make_app(sd, monkeypatch, tmp_path)
+
+        def shown(modal):
+            return "\n".join(
+                s.text for s in modal.query_one("#log-content", sd.RichLog).lines)
+
+        async def scenario():
+            async with app.run_test(size=(200, 50)) as pilot:
+                app.notify = lambda *a, **k: None
+                await pilot.pause()
+                modal = sd.LogViewerModal("101", str(out), str(err), live=False)
+                app.push_screen(modal)
+                for which, want, other in (("stdout", "stdout line", "stderr line"),
+                                           ("stderr", "stderr line", "stdout line"),
+                                           ("stdout", "stdout line", "stderr line")):
+                    if which != "stdout" or getattr(modal, "_seen", False):
+                        modal._show_stream(which)
+                    await pilot.pause()
+                    await app.workers.wait_for_complete()
+                    await pilot.pause()
+                    assert want in shown(modal)
+                    assert other not in shown(modal)
+                    modal._seen = True
+                app.exit()
+        run(scenario())
+
     def test_missing_file_message(self, sd, monkeypatch, tmp_path):
         app = make_app(sd, monkeypatch, tmp_path)
 

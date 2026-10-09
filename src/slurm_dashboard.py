@@ -3544,6 +3544,7 @@ class LogViewerModal(ModalScreen):
     """
 
     _showing: str = "stdout"
+    _rendered: str = ""         # stream currently drawn in #log-content
     _live: bool = True
     _current_path: str = ""
     _timer: Timer | None = None
@@ -3718,9 +3719,12 @@ class LogViewerModal(ModalScreen):
     def _apply_stream_error(self, which: str, path: str, msg: str) -> None:
         if not self.is_attached:
             return
-        self._current_path = path
         self._buffers[which] = []
         self._offsets[which] = 0
+        if which != self._showing:
+            return              # stale read for a stream no longer on screen
+        self._current_path = path
+        self._rendered = which
         self._sync_header(which, path)
         log = self.query_one("#log-content", RichLog)
         log.clear()
@@ -3731,7 +3735,6 @@ class LogViewerModal(ModalScreen):
                             offset: int, reset: bool) -> None:
         if not self.is_attached:
             return
-        self._current_path = path
         self._offsets[which] = offset
         if reset:
             self._buffers[which] = list(lines)
@@ -3740,8 +3743,13 @@ class LogViewerModal(ModalScreen):
         # Bound memory on a job that logs forever.
         if len(self._buffers[which]) > self.MAX_BUFFER_LINES:
             del self._buffers[which][:-self.MAX_BUFFER_LINES]
+        if which != self._showing:
+            return              # stale read for a stream no longer on screen
+        self._current_path = path
         self._sync_header(which, path)
-        if reset or lines:
+        # Switching back to a stream already read to EOF yields no new lines,
+        # but the view still shows the other stream and must be redrawn.
+        if reset or lines or which != self._rendered:
             self._refresh_view()
 
     def _sync_header(self, which: str, path: str) -> None:
@@ -3777,6 +3785,7 @@ class LogViewerModal(ModalScreen):
             return
         log = self.query_one("#log-content", RichLog)
         log.clear()
+        self._rendered = self._showing
         buf = self._buffers.get(self._showing, [])
         if not buf:
             log.write(Text("(File is empty)", style=f"{C.FG_FAINT} italic"))
